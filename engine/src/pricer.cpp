@@ -114,8 +114,18 @@ double GKPricer::strike_from_delta(double spot, double T,
                          int max_iter, double tol) const {
 
     // acklam's to search strike from ATM vol + spot price (1st iteration)
+    double abs_delta = std::abs(target_delta);
     double vol_atm = vol_provider.get_vol(spot, T);
-    double d1 = norm_inv(target_delta * std::exp(foreign_rate_ * T));
+    double df = std::exp(foreign_rate_ * T);
+    
+    double nd1;
+    if (is_call) {
+        nd1 = abs_delta * df;
+    } else {
+        nd1 = 1.0 - (abs_delta * df);
+    }
+
+    double d1 = norm_inv(nd1);
     double K = spot * std::exp(-(d1 * vol_atm * std::sqrt(T) 
                - (domestic_rate_ - foreign_rate_ + 0.5 * vol_atm * vol_atm) * T)); 
     
