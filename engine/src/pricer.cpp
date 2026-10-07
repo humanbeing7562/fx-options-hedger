@@ -136,8 +136,8 @@ double GKPricer::strike_from_delta(double spot, double T,
         double error = r.delta - target_delta;
         
         if (std::abs(error) < tol) break;
-        
-        K = K - error / (-r.gamma);
+        double d_delta_dK = -r.gamma * spot / K;
+        K = K - error / d_delta_dK;
     }
     return K;
 }
