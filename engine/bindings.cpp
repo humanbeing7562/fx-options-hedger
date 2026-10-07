@@ -59,6 +59,24 @@ PYBIND11_MODULE(fxengine, m) {
              py::arg("k_25p"), py::arg("k_atm"), py::arg("k_25c"),
              py::arg("vol_25p"), py::arg("vol_atm"), py::arg("vol_25c"));
 
+    py::class_<SabrSmile, Smile, std::shared_ptr<SabrSmile>>(m, "SabrSmile")
+        .def(py::init<double, double, double, double, double, double>(),
+             py::arg("forward"), py::arg("T"), py::arg("alpha"),
+             py::arg("beta"), py::arg("rho"), py::arg("nu"));
+
+    py::class_<SabrFit>(m, "SabrFit")
+        .def_readonly("alpha", &SabrFit::alpha)
+        .def_readonly("beta", &SabrFit::beta)
+        .def_readonly("rho", &SabrFit::rho)
+        .def_readonly("nu", &SabrFit::nu)
+        .def_readonly("rms_error", &SabrFit::rms_error)
+        .def_readonly("max_error", &SabrFit::max_error)
+        .def_readonly("converged", &SabrFit::converged);
+
+    m.def("calibrate_sabr", &calibrate_sabr,
+          py::arg("strikes"), py::arg("vols"), py::arg("forward"), py::arg("T"),
+          py::arg("beta"), py::arg("start_alpha"), py::arg("start_rho"), py::arg("start_nu"));
+
     py::class_<TenorQuote>(m, "TenorQuote")
         .def(py::init<>())
         .def_readwrite("T", &TenorQuote::T)
@@ -81,10 +99,14 @@ PYBIND11_MODULE(fxengine, m) {
         .def_readonly("vol_25p", &TenorSmile::vol_25p)
         .def_readonly("vol_atm", &TenorSmile::vol_atm)
         .def_readonly("vol_25c", &TenorSmile::vol_25c)
-        .def_readonly("vol_10c", &TenorSmile::vol_10c);
+        .def_readonly("vol_10c", &TenorSmile::vol_10c)
+        .def_readonly("sabr", &TenorSmile::sabr);
 
     py::class_<SmileVol, VolProvider>(m, "SmileVol")
-        .def(py::init<double, const YieldCurve&, const YieldCurve&, const std::vector<TenorQuote>&>(),
-             py::arg("spot"), py::arg("domestic"), py::arg("foreign"), py::arg("quotes"))
-        .def("tenors", &SmileVol::tenors, py::return_value_policy::reference_internal);
+        .def(py::init<double, const YieldCurve&, const YieldCurve&,
+                      const std::vector<TenorQuote>&, const std::string&>(),
+             py::arg("spot"), py::arg("domestic"), py::arg("foreign"),
+             py::arg("quotes"), py::arg("model") = "vv")
+        .def("tenors", &SmileVol::tenors, py::return_value_policy::reference_internal)
+        .def("model", &SmileVol::model);
 }
