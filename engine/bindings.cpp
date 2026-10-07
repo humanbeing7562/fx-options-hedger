@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>     // lets Python lists turn into std::vector automatically
 #include "yield_curve.hpp"
+#include "pricer.hpp"
 
 namespace py = pybind11;
 
@@ -18,4 +19,19 @@ PYBIND11_MODULE(fxengine, m) {
     py::class_<InterpolatedCurve, YieldCurve>(m, "InterpolatedCurve")
         .def(py::init<const std::vector<double>&, const std::vector<double>&>(),
              py::arg("tenors"), py::arg("rates"));
+
+    py::class_<PricingResult>(m, "PricingResult")
+        .def_readonly("price", &PricingResult::price)
+        .def_readonly("delta", &PricingResult::delta)
+        .def_readonly("gamma", &PricingResult::gamma)
+        .def_readonly("vega", &PricingResult::vega)
+        .def_readonly("theta", &PricingResult::theta)
+        .def_readonly("rho", &PricingResult::rho);
+
+    py::class_<GKPricer>(m, "GKPricer")
+        .def(py::init<double, double>(),
+             py::arg("domestic_rate"), py::arg("foreign_rate"))
+        .def("price", &GKPricer::price,
+             py::arg("spot"), py::arg("strike"), py::arg("T"),
+             py::arg("vol"), py::arg("is_call"));
 }

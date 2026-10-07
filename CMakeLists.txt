@@ -11,6 +11,7 @@ find_package(pybind11 CONFIG REQUIRED)
 pybind11_add_module(fxengine
     engine/bindings.cpp
     engine/src/yield_curve.cpp
+    engine/src/pricer.cpp
 )
 
 target_include_directories(fxengine PRIVATE engine/include)
