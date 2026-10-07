@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include "vol_provider.hpp"
 
 struct PricingResult {
     double price;
@@ -8,24 +9,6 @@ struct PricingResult {
     double theta;
     double vega;
     double rho;
-};
-
-class VolProvider {
-public:
-    virtual ~VolProvider() = default;
-    virtual double get_vol(double strike, double T) const = 0;
-};
-
-class FlatVol : public VolProvider {
-    double vol_;
-public:
-    FlatVol(double vol) : vol_(vol) {}
-    void set_vol(double vol) { vol_ = vol; }
-    double get_vol(double strike, double T) const override { return vol_; }
-};
-
-class SmileVol : public VolProvider {
-    // TBC
 };
 
 class Pricer {
@@ -40,7 +23,6 @@ class Pricer {
             bool is_call
         ) const = 0;
 };
-
 
 class BSPricer: public Pricer {
     public:

@@ -3,6 +3,7 @@
 #include "yield_curve.hpp"
 #include "pricer.hpp"
 #include "vol_provider.hpp"
+#include "smile_vol.hpp"
 
 namespace py = pybind11;
 
@@ -48,4 +49,42 @@ PYBIND11_MODULE(fxengine, m) {
              py::arg("spot"), py::arg("T"), py::arg("vol_provider"),
              py::arg("target_delta"), py::arg("is_call"),
              py::arg("max_iter") = 50, py::arg("tol") = 1e-10);
+
+    // ---------- Smile ----------
+    py::class_<Smile, std::shared_ptr<Smile>>(m, "Smile")
+        .def("vol", &Smile::vol, py::arg("strike"));
+
+    py::class_<VannaVolgaSmile, Smile, std::shared_ptr<VannaVolgaSmile>>(m, "VannaVolgaSmile")
+        .def(py::init<double, double, double, double, double, double>(),
+             py::arg("k_25p"), py::arg("k_atm"), py::arg("k_25c"),
+             py::arg("vol_25p"), py::arg("vol_atm"), py::arg("vol_25c"));
+
+    py::class_<TenorQuote>(m, "TenorQuote")
+        .def(py::init<>())
+        .def_readwrite("T", &TenorQuote::T)
+        .def_readwrite("vol_10p", &TenorQuote::vol_10p)
+        .def_readwrite("vol_25p", &TenorQuote::vol_25p)
+        .def_readwrite("vol_atm", &TenorQuote::vol_atm)
+        .def_readwrite("vol_25c", &TenorQuote::vol_25c)
+        .def_readwrite("vol_10c", &TenorQuote::vol_10c);
+
+    // Read-only view of a built tenor (the smile pointer itself isn't exposed)
+    py::class_<TenorSmile>(m, "TenorSmile")
+        .def_readonly("T", &TenorSmile::T)
+        .def_readonly("forward", &TenorSmile::forward)
+        .def_readonly("k_10p", &TenorSmile::k_10p)
+        .def_readonly("k_25p", &TenorSmile::k_25p)
+        .def_readonly("k_atm", &TenorSmile::k_atm)
+        .def_readonly("k_25c", &TenorSmile::k_25c)
+        .def_readonly("k_10c", &TenorSmile::k_10c)
+        .def_readonly("vol_10p", &TenorSmile::vol_10p)
+        .def_readonly("vol_25p", &TenorSmile::vol_25p)
+        .def_readonly("vol_atm", &TenorSmile::vol_atm)
+        .def_readonly("vol_25c", &TenorSmile::vol_25c)
+        .def_readonly("vol_10c", &TenorSmile::vol_10c);
+
+    py::class_<SmileVol, VolProvider>(m, "SmileVol")
+        .def(py::init<double, const YieldCurve&, const YieldCurve&, const std::vector<TenorQuote>&>(),
+             py::arg("spot"), py::arg("domestic"), py::arg("foreign"), py::arg("quotes"))
+        .def("tenors", &SmileVol::tenors, py::return_value_policy::reference_internal);
 }

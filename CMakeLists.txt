@@ -12,6 +12,7 @@ pybind11_add_module(fxengine
     engine/bindings.cpp
     engine/src/yield_curve.cpp
     engine/src/pricer.cpp
+    engine/src/smile_vol.cpp
 )
 
 target_include_directories(fxengine PRIVATE engine/include)
