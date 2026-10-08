@@ -28,19 +28,15 @@ void Portfolio::add_spot_hedge(double amount, double rate) {
     spot_hedges_.push_back({amount, rate});
 }
 
-PricingResult Portfolio::aggregate_greeks(
-        double spot, double current_time,
-        const Pricer& pricer,
-        const VolProvider& vol_provider) const {
-    
+PricingResult Portfolio::aggregate_greeks(const MarketSnapshot& mkt) const {
     PricingResult total = {0, 0, 0, 0, 0, 0};
 
     for (const auto& pos : options_) {
-        double T = pos.expiry - current_time;
+        double T = pos.expiry - mkt.time();
         if (T <= 0) continue;
 
-        double vol = vol_provider.get_vol(pos.strike, T);
-        PricingResult r = pricer.price(spot, pos.strike, T, vol, pos.is_call);
+        // The snapshot picks the rates for this T and the smile vol for this strike
+        PricingResult r = mkt.price(pos.strike, T, pos.is_call);
 
         total.price += r.price * pos.notional;
         total.delta += r.delta * pos.notional;
@@ -53,22 +49,17 @@ PricingResult Portfolio::aggregate_greeks(
     return total;
 }
 
-std::map<double, PricingResult> Portfolio::greeks_by_expiry(
-        double spot, double current_time,
-        const Pricer& pricer,
-        const VolProvider& vol_provider) const {
-    
+std::map<double, PricingResult> Portfolio::greeks_by_expiry(const MarketSnapshot& mkt) const {
     std::map<double, PricingResult> buckets;
 
     for (const auto& pos : options_) {
-        double T = pos.expiry - current_time;
+        double T = pos.expiry - mkt.time();
         if (T <= 0) continue;
 
-        double vol = vol_provider.get_vol(pos.strike, T);
-        PricingResult r = pricer.price(spot, pos.strike, T, vol, pos.is_call);
+        PricingResult r = mkt.price(pos.strike, T, pos.is_call);
 
         double bucket = snap_to_bucket(T);
-        
+
         if (buckets.find(bucket) == buckets.end()) {
             buckets[bucket] = {0, 0, 0, 0, 0, 0};
         }

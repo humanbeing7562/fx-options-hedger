@@ -10,6 +10,12 @@ import fxengine
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def years_between(start, end):
+    # Calendar time in years (ACT/365), the sim's clock unit
+    seconds = (pd.Timestamp(end) - pd.Timestamp(start)).total_seconds()
+    return seconds / (365.0 * 24 * 3600)
+
+
 class MarketLoader:
     def __init__(self, clean_dir=None):
         if clean_dir is None:
@@ -157,6 +163,22 @@ class MarketLoader:
             tenor_quotes.append(tq)
 
         return fxengine.SmileVol(spot, cny, usd, tenor_quotes, model)
+
+    def get_snapshot(self, timestamp, sim_start, model="vv"):
+        """
+        Builds the C++ MarketSnapshot for one fixing: spot, both curves, vol surface.
+        Its time is years since sim_start - the same clock position expiries use.
+        """
+        timestamp = pd.Timestamp(timestamp)
+        sim_start = pd.Timestamp(sim_start)
+        if timestamp < sim_start:
+            raise ValueError(f"{timestamp} is before the sim start {sim_start}")
+
+        time = years_between(sim_start, timestamp)
+        spot = self.get_spot(timestamp)
+        cny, usd = self.get_curves(timestamp)
+        surface = self.get_smile_vol(timestamp, model)
+        return fxengine.MarketSnapshot(time, spot, cny, usd, surface)
 
     def get_vol_quote(self, timestamp, tenor, pillar):
         timestamp = pd.Timestamp(timestamp)

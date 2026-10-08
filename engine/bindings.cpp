@@ -4,6 +4,8 @@
 #include "pricer.hpp"
 #include "vol_provider.hpp"
 #include "smile_vol.hpp"
+#include "market_snapshot.hpp"
+#include "portfolio.hpp"
 
 namespace py = pybind11;
 
@@ -109,4 +111,38 @@ PYBIND11_MODULE(fxengine, m) {
              py::arg("quotes"), py::arg("model") = "vv")
         .def("tenors", &SmileVol::tenors, py::return_value_policy::reference_internal)
         .def("model", &SmileVol::model);
+
+    // ---------- Market snapshot ----------
+    // keep_alive: the snapshot only points to the curves and vol surface,
+    // so Python must not free them while the snapshot exists.
+    py::class_<MarketSnapshot>(m, "MarketSnapshot")
+        .def(py::init<double, double, const YieldCurve&, const YieldCurve&, const VolProvider&>(),
+             py::arg("time"), py::arg("spot"), py::arg("domestic"), py::arg("foreign"), py::arg("vol"),
+             py::keep_alive<1, 4>(), py::keep_alive<1, 5>(), py::keep_alive<1, 6>())
+        .def("time", &MarketSnapshot::time)
+        .def("spot", &MarketSnapshot::spot)
+        .def("domestic_rate", &MarketSnapshot::domestic_rate, py::arg("T"))
+        .def("foreign_rate", &MarketSnapshot::foreign_rate, py::arg("T"))
+        .def("forward", &MarketSnapshot::forward, py::arg("T"))
+        .def("vol", &MarketSnapshot::vol, py::arg("strike"), py::arg("T"))
+        .def("price", &MarketSnapshot::price, py::arg("strike"), py::arg("T"), py::arg("is_call"));
+
+    // ---------- Portfolio ----------
+    py::class_<Position>(m, "Position")
+        .def(py::init<>())
+        .def_readwrite("id", &Position::id)
+        .def_readwrite("strike", &Position::strike)
+        .def_readwrite("expiry", &Position::expiry)
+        .def_readwrite("is_call", &Position::is_call)
+        .def_readwrite("notional", &Position::notional);
+
+    py::class_<Portfolio>(m, "Portfolio")
+        .def(py::init<>())
+        .def("add_option", &Portfolio::add_option, py::arg("position"))
+        .def("remove_option", &Portfolio::remove_option, py::arg("position_id"))
+        .def("add_spot_hedge", &Portfolio::add_spot_hedge, py::arg("amount"), py::arg("rate"))
+        .def("aggregate_greeks", &Portfolio::aggregate_greeks, py::arg("market"))
+        .def("greeks_by_expiry", &Portfolio::greeks_by_expiry, py::arg("market"))
+        .def("get_options", &Portfolio::get_options, py::return_value_policy::reference_internal)
+        .def("get_net_spot", &Portfolio::get_net_spot);
 }
