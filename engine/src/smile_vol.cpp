@@ -10,9 +10,11 @@
 // ======================================================================
 
 VannaVolgaSmile::VannaVolgaSmile(double k_25p, double k_atm, double k_25c,
-                                 double vol_25p, double vol_atm, double vol_25c)
+                                 double vol_25p, double vol_atm, double vol_25c,
+                                 double k_min, double k_max, double T)
     : k1_(k_25p), k2_(k_atm), k3_(k_25c),
-      v1_(vol_25p), v2_(vol_atm), v3_(vol_25c) {
+      v1_(vol_25p), v2_(vol_atm), v3_(vol_25c),
+      k_min_(k_min), k_max_(k_max) {
 
     if (!(k1_ < k2_ && k2_ < k3_)) {
         throw std::invalid_argument("vanna-volga strikes must be ordered 25P < ATM < 25C");
@@ -20,12 +22,60 @@ VannaVolgaSmile::VannaVolgaSmile(double k_25p, double k_atm, double k_25c,
     if (v1_ <= 0 || v2_ <= 0 || v3_ <= 0) {
         throw std::invalid_argument("vanna-volga vols must be positive");
     }
+    if (!(k_min_ <= k1_ && k3_ <= k_max_)) {
+        throw std::invalid_argument("wing limits must lie outside the 25P and 25C strikes");
+    }
+
+    bool has_low = k_min_ > 0.0;
+    bool has_high = k_max_ < std::numeric_limits<double>::infinity();
+    if ((has_low || has_high) && T <= 0) {
+        throw std::invalid_argument("T must be positive when wing limits are set");
+    }
+
+    // Slope of the VV smile in log-strike at each join (central difference)
+    double h = 1e-6;
+    if (has_low) {
+        vol_low_ = raw_vol(k_min_);
+        double up = raw_vol(k_min_ * std::exp(h));
+        double down = raw_vol(k_min_ * std::exp(-h));
+        slope_low_ = -(up - down) / (2.0 * h);           // outward = towards lower strikes
+        length_low_ = WING_LENGTH_SD * vol_low_ * std::sqrt(T);
+    }
+    if (has_high) {
+        vol_high_ = raw_vol(k_max_);
+        double up = raw_vol(k_max_ * std::exp(h));
+        double down = raw_vol(k_max_ * std::exp(-h));
+        slope_high_ = (up - down) / (2.0 * h);           // outward = towards higher strikes
+        length_high_ = WING_LENGTH_SD * vol_high_ * std::sqrt(T);
+    }
 }
 
 double VannaVolgaSmile::vol(double strike) const {
     if (strike <= 0) {
         throw std::invalid_argument("strike must be positive");
     }
+
+    double floor = 0.001;
+    if (strike < k_min_) {
+        double u = std::log(k_min_ / strike);
+        double result = vol_low_ + slope_low_ * length_low_ * (1.0 - std::exp(-u / length_low_));
+        if (result < floor) {
+            result = floor;
+        }
+        return result;
+    }
+    if (strike > k_max_) {
+        double u = std::log(strike / k_max_);
+        double result = vol_high_ + slope_high_ * length_high_ * (1.0 - std::exp(-u / length_high_));
+        if (result < floor) {
+            result = floor;
+        }
+        return result;
+    }
+    return raw_vol(strike);
+}
+
+double VannaVolgaSmile::raw_vol(double strike) const {
 
     // First-order vanna-volga (Castagna-Mercurio).
     // Each weight is 1 at its own pillar and 0 at the other two,
@@ -152,7 +202,7 @@ SmileVol::SmileVol(double spot,
                    const YieldCurve& foreign,
                    const std::vector<TenorQuote>& quotes,
                    const std::string& model)
-    : model_(model) {
+    : model_(model), spot_(spot) {
 
     if (model_ != "vv" && model_ != "sabr") {
         throw std::invalid_argument("model must be \"vv\" or \"sabr\", got \"" + model_ + "\"");
@@ -203,7 +253,8 @@ SmileVol::SmileVol(double spot,
         // Smile model for this tenor
         if (model_ == "vv") {
             s.smile = std::make_shared<VannaVolgaSmile>(s.k_25p, s.k_atm, s.k_25c,
-                                                        s.vol_25p, s.vol_atm, s.vol_25c);
+                                                        s.vol_25p, s.vol_atm, s.vol_25c,
+                                                        s.k_10p, s.k_10c, s.T);
         } else {
             std::vector<double> strikes = {s.k_10p, s.k_25p, s.k_atm, s.k_25c, s.k_10c};
             std::vector<double> vols = {s.vol_10p, s.vol_25p, s.vol_atm, s.vol_25c, s.vol_10c};
@@ -227,34 +278,90 @@ SmileVol::SmileVol(double spot,
     }
 }
 
-double SmileVol::get_vol(double strike, double T) const {
+double SmileVol::tenor_vol(size_t index, double strike) const {
+    if (index >= smiles_.size()) {
+        throw std::out_of_range("tenor index out of range");
+    }
+    return smiles_[index].smile->vol(strike);
+}
+
+double SmileVol::forward(double T) const {
+    if (T < 0) {
+        throw std::invalid_argument("T must not be negative");
+    }
     size_t last = smiles_.size() - 1;
 
-    // Shorter than the first tenor or longer than the last: use that tenor's smile
+    // Before the first tenor: between spot (T = 0) and the first forward
     if (T <= smiles_[0].T) {
-        return smiles_[0].smile->vol(strike);
+        double a = std::log(spot_);
+        double b = std::log(smiles_[0].forward);
+        return std::exp(a + (b - a) * T / smiles_[0].T);
     }
     if (T >= smiles_[last].T) {
-        return smiles_[last].smile->vol(strike);
+        if (last == 0) {
+            return smiles_[0].forward;
+        }
+        // Continue the last segment's slope
+        const TenorSmile& a = smiles_[last - 1];
+        const TenorSmile& b = smiles_[last];
+        double slope = (std::log(b.forward) - std::log(a.forward)) / (b.T - a.T);
+        return std::exp(std::log(b.forward) + slope * (T - b.T));
+    }
+    for (size_t i = 0; i < last; i++) {
+        const TenorSmile& a = smiles_[i];
+        const TenorSmile& b = smiles_[i + 1];
+        if (T <= b.T) {
+            double weight = (T - a.T) / (b.T - a.T);
+            return std::exp(std::log(a.forward) + weight * (std::log(b.forward) - std::log(a.forward)));
+        }
+    }
+    return smiles_[last].forward;   // not reached
+}
+
+std::vector<double> SmileVol::floored_variances(double moneyness) const {
+    std::vector<double> result;
+    double highest = 0.0;
+    for (size_t i = 0; i < smiles_.size(); i++) {
+        const TenorSmile& s = smiles_[i];
+        double vol = s.smile->vol(moneyness * s.forward);
+        double variance = vol * vol * s.T;
+        if (variance > highest) {
+            highest = variance;
+        }
+        result.push_back(highest);
+    }
+    return result;
+}
+
+double SmileVol::get_vol(double strike, double T) const {
+    if (strike <= 0) {
+        throw std::invalid_argument("strike must be positive");
+    }
+    if (T <= 0) {
+        throw std::invalid_argument("T must be positive");
     }
 
-    // Find the two tenors either side of T and blend in total variance (vol^2 * T)
+    size_t last = smiles_.size() - 1;
+    double moneyness = strike / forward(T);
+    std::vector<double> variances = floored_variances(moneyness);
+
+    // Shorter than the first tenor or longer than the last: that tenor's vol at this moneyness
+    if (T <= smiles_[0].T) {
+        return std::sqrt(variances[0] / smiles_[0].T);
+    }
+    if (T >= smiles_[last].T) {
+        return std::sqrt(variances[last] / smiles_[last].T);
+    }
+
+    // Between two tenors: straight line in total variance
     for (size_t i = 0; i < last; i++) {
         const TenorSmile& left = smiles_[i];
         const TenorSmile& right = smiles_[i + 1];
-
         if (T <= right.T) {
-            double vol_left = left.smile->vol(strike);
-            double vol_right = right.smile->vol(strike);
-
-            double var_left = vol_left * vol_left * left.T;
-            double var_right = vol_right * vol_right * right.T;
-
             double weight = (T - left.T) / (right.T - left.T);
-            double var = var_left + weight * (var_right - var_left);
-            return std::sqrt(var / T);
+            double variance = variances[i] + weight * (variances[i + 1] - variances[i]);
+            return std::sqrt(variance / T);
         }
     }
-
-    return smiles_[last].smile->vol(strike);   // not reached
+    return std::sqrt(variances[last] / smiles_[last].T);   // not reached
 }

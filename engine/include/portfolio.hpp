@@ -4,6 +4,9 @@
 #include "pricer.hpp"
 #include "market_snapshot.hpp"
 
+// One option in the book.
+// expiry is on the sim clock (years since the sim started), like MarketSnapshot::time.
+// notional > 0 = long, notional < 0 = short (in USD).
 struct Position {
     int id = 0;
     double strike = 0.0;
@@ -26,7 +29,7 @@ public:
     // Totals across all live options (expired ones are skipped)
     PricingResult aggregate_greeks(const MarketSnapshot& mkt) const;
 
-    // Same, grouped into expiry buckets (1W, 1M, 3M, 6M, 1Y)
+    // Same, grouped into expiry buckets: <=1W, <=1M, <=3M, <=6M, longer (keys 7/365 ... 1.0)
     std::map<double, PricingResult> greeks_by_expiry(const MarketSnapshot& mkt) const;
 
     const std::vector<Position>& get_options() const;

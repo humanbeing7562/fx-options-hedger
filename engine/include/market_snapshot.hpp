@@ -22,6 +22,13 @@ public:
     // Garman-Kohlhagen with the rates for this T and the smile vol for this strike
     PricingResult price(double strike, double T, bool is_call) const;
 
+    // Strike with this spot delta at maturity T, searched on this snapshot's smile
+    // (e.g. 0.25 call, -0.25 put). Works for any T, not just the quoted tenors.
+    double strike_from_delta(double delta, double T, bool is_call) const;
+
+    // ATM (delta-neutral straddle) strike at maturity T, on this snapshot's smile
+    double atm_strike(double T) const;
+
 private:
     double time_;
     double spot_;

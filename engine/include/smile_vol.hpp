@@ -2,6 +2,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <limits>
 #include "vol_provider.hpp"
 #include "yield_curve.hpp"
 
@@ -15,15 +16,33 @@ public:
 };
 
 // Vanna-volga through the 25P / ATM / 25C dots
+// Wings beyond [k_min, k_max] (the 10P and 10C strikes when built by SmileVol):
+//   First-order VV is quadratic in log-strike and explodes far out (~49% vol for a 1W
+//   strike 5% out, against 1.6% ATM). Holding the vol flat instead puts a kink in the
+//   option-price curve at the join, which means negative probability (butterfly
+//   arbitrage). So past each join the vol keeps the smile's slope and levels off:
+//       vol(u) = vol_join + slope * L * (1 - exp(-u / L)),   u = log-distance past the join
+//   with L = WING_LENGTH_SD standard deviations (vol_join * sqrt(T)). Smooth at the join,
+//   bounded far out, and arbitrage-free on every smile in the Jul-Sep data (tested).
 class VannaVolgaSmile : public Smile {
 public:
+    static constexpr double WING_LENGTH_SD = 3.0;
+
     VannaVolgaSmile(double k_25p, double k_atm, double k_25c,
-                    double vol_25p, double vol_atm, double vol_25c);
+                    double vol_25p, double vol_atm, double vol_25c,
+                    double k_min = 0.0, double k_max = std::numeric_limits<double>::infinity(),
+                    double T = 0.0);
     double vol(double strike) const override;
 
 private:
+    double raw_vol(double strike) const;      // the VV formula, no wing control
     double k1_, k2_, k3_;      // 25P, ATM, 25C strikes
     double v1_, v2_, v3_;      // 25P, ATM, 25C vols
+    double k_min_, k_max_;     // wings start beyond these strikes
+
+    // Wing shape, worked out once in the constructor
+    double vol_low_ = 0.0, slope_low_ = 0.0, length_low_ = 1.0;     // put side
+    double vol_high_ = 0.0, slope_high_ = 0.0, length_high_ = 1.0;  // call side
 };
 
 // SABR (Hagan 2002 lognormal approximation).
@@ -101,11 +120,6 @@ struct TenorSmile {
     std::shared_ptr<const Smile> smile;
 };
 
-// The vol surface at one snapshot.
-//   - constructor: deltas -> strikes for every tenor, builds one Smile per tenor
-//     model = "vv"   -> VannaVolgaSmile from 25P / ATM / 25C
-//     model = "sabr" -> SABR fitted here to all 5 pillars (QuantLib), beta fixed at 1
-//   - get_vol(K, T): that tenor's Smile, blended in total variance between tenors
 class SmileVol : public VolProvider {
 public:
     SmileVol(double spot,
@@ -116,11 +130,21 @@ public:
 
     double get_vol(double strike, double T) const override;
 
+    // One tenor's own smile (VV or SABR), WITHOUT the calendar floor - for tests and plots
+    double tenor_vol(size_t index, double strike) const;
+
+    // Forward for any maturity: log-linear between the tenor forwards (spot at T = 0)
+    double forward(double T) const;
+
     // Read-only access for tests and plots
     const std::vector<TenorSmile>& tenors() const { return smiles_; }
     const std::string& model() const { return model_; }
 
 private:
+    // Total variance of every tenor at moneyness x, after the calendar floor
+    std::vector<double> floored_variances(double moneyness) const;
+
     std::vector<TenorSmile> smiles_;     // sorted by T, shortest first
     std::string model_;
+    double spot_;
 };

@@ -1,10 +1,15 @@
 #include "portfolio.hpp"
 
+// Bucket edges match the tenor day counts used everywhere else
+// (1W = 7, 1M = 30, 3M = 91, 6M = 182 days), so a 3M option lands in the 3M bucket.
+// EDGE_TOL absorbs floating-point rounding (expiry - time can come out as 7.000000000000002 days).
+static const double EDGE_TOL = 1e-9;
+
 static double snap_to_bucket(double T) {
-    if (T <= 7.0/365)   return 7.0/365;
-    if (T <= 30.0/365)  return 30.0/365;
-    if (T <= 90.0/365)  return 90.0/365;
-    if (T <= 180.0/365) return 180.0/365;
+    if (T <= 7.0/365 + EDGE_TOL)   return 7.0/365;
+    if (T <= 30.0/365 + EDGE_TOL)  return 30.0/365;
+    if (T <= 91.0/365 + EDGE_TOL)  return 91.0/365;
+    if (T <= 182.0/365 + EDGE_TOL) return 182.0/365;
     return 365.0/365;
 }
 
@@ -29,7 +34,7 @@ void Portfolio::add_spot_hedge(double amount, double rate) {
 }
 
 PricingResult Portfolio::aggregate_greeks(const MarketSnapshot& mkt) const {
-    PricingResult total = {0, 0, 0, 0, 0, 0};
+    PricingResult total;
 
     for (const auto& pos : options_) {
         double T = pos.expiry - mkt.time();
@@ -44,6 +49,8 @@ PricingResult Portfolio::aggregate_greeks(const MarketSnapshot& mkt) const {
         total.theta += r.theta * pos.notional;
         total.vega  += r.vega  * pos.notional;
         total.rho   += r.rho   * pos.notional;
+        total.vanna += r.vanna * pos.notional;
+        total.volga += r.volga * pos.notional;
     }
 
     return total;
@@ -61,7 +68,7 @@ std::map<double, PricingResult> Portfolio::greeks_by_expiry(const MarketSnapshot
         double bucket = snap_to_bucket(T);
 
         if (buckets.find(bucket) == buckets.end()) {
-            buckets[bucket] = {0, 0, 0, 0, 0, 0};
+            buckets[bucket] = PricingResult();
         }
 
         buckets[bucket].price += r.price * pos.notional;
@@ -70,6 +77,8 @@ std::map<double, PricingResult> Portfolio::greeks_by_expiry(const MarketSnapshot
         buckets[bucket].theta += r.theta * pos.notional;
         buckets[bucket].vega  += r.vega  * pos.notional;
         buckets[bucket].rho   += r.rho   * pos.notional;
+        buckets[bucket].vanna += r.vanna * pos.notional;
+        buckets[bucket].volga += r.volga * pos.notional;
     }
 
     return buckets;

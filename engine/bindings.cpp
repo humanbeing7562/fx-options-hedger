@@ -32,7 +32,9 @@ PYBIND11_MODULE(fxengine, m) {
         .def_readonly("gamma", &PricingResult::gamma)
         .def_readonly("vega", &PricingResult::vega)
         .def_readonly("theta", &PricingResult::theta)
-        .def_readonly("rho", &PricingResult::rho);
+        .def_readonly("rho", &PricingResult::rho)
+        .def_readonly("vanna", &PricingResult::vanna)
+        .def_readonly("volga", &PricingResult::volga);
 
     // ---------- Vol ----------
     py::class_<VolProvider>(m, "VolProvider")
@@ -57,9 +59,12 @@ PYBIND11_MODULE(fxengine, m) {
         .def("vol", &Smile::vol, py::arg("strike"));
 
     py::class_<VannaVolgaSmile, Smile, std::shared_ptr<VannaVolgaSmile>>(m, "VannaVolgaSmile")
-        .def(py::init<double, double, double, double, double, double>(),
+        .def(py::init<double, double, double, double, double, double, double, double, double>(),
              py::arg("k_25p"), py::arg("k_atm"), py::arg("k_25c"),
-             py::arg("vol_25p"), py::arg("vol_atm"), py::arg("vol_25c"));
+             py::arg("vol_25p"), py::arg("vol_atm"), py::arg("vol_25c"),
+             py::arg("k_min") = 0.0,
+             py::arg("k_max") = std::numeric_limits<double>::infinity(),
+             py::arg("T") = 0.0);
 
     py::class_<SabrSmile, Smile, std::shared_ptr<SabrSmile>>(m, "SabrSmile")
         .def(py::init<double, double, double, double, double, double>(),
@@ -110,6 +115,8 @@ PYBIND11_MODULE(fxengine, m) {
              py::arg("spot"), py::arg("domestic"), py::arg("foreign"),
              py::arg("quotes"), py::arg("model") = "vv")
         .def("tenors", &SmileVol::tenors, py::return_value_policy::reference_internal)
+        .def("tenor_vol", &SmileVol::tenor_vol, py::arg("index"), py::arg("strike"))
+        .def("forward", &SmileVol::forward, py::arg("T"))
         .def("model", &SmileVol::model);
 
     // ---------- Market snapshot ----------
@@ -125,7 +132,10 @@ PYBIND11_MODULE(fxengine, m) {
         .def("foreign_rate", &MarketSnapshot::foreign_rate, py::arg("T"))
         .def("forward", &MarketSnapshot::forward, py::arg("T"))
         .def("vol", &MarketSnapshot::vol, py::arg("strike"), py::arg("T"))
-        .def("price", &MarketSnapshot::price, py::arg("strike"), py::arg("T"), py::arg("is_call"));
+        .def("price", &MarketSnapshot::price, py::arg("strike"), py::arg("T"), py::arg("is_call"))
+        .def("strike_from_delta", &MarketSnapshot::strike_from_delta,
+             py::arg("delta"), py::arg("T"), py::arg("is_call"))
+        .def("atm_strike", &MarketSnapshot::atm_strike, py::arg("T"));
 
     // ---------- Portfolio ----------
     py::class_<Position>(m, "Position")

@@ -94,6 +94,10 @@ PricingResult BSPricer::price(double spot, double strike, double T,
                    - (is_call ? 1.0 : -1.0) * rate_ * strike * df 
                      * norm_cdf(is_call ? d2_val : -d2_val);
 
+    // Same for calls and puts
+    result.vanna = -norm_pdf(d1_val) * d2_val / vol;
+    result.volga = result.vega * d1_val * d2_val / vol;
+
     return result;
 }
 
@@ -136,6 +140,7 @@ double GKPricer::strike_from_delta(double spot, double T,
         double error = r.delta - target_delta;
         
         if (std::abs(error) < tol) break;
+        
         double d_delta_dK = -r.gamma * spot / K;
         K = K - error / d_delta_dK;
     }
@@ -167,6 +172,10 @@ PricingResult GKPricer::price(double spot, double strike, double T,
     result.theta = -(spot * d_foreign * norm_pdf(d1_val) * vol) / (2.0 * sqrt_T)
                + foreign_rate_ * spot * d_foreign * norm_cdf(is_call ? d1_val : -d1_val) * (is_call ? 1.0 : -1.0)
                - domestic_rate_ * strike * d_domestic * norm_cdf(is_call ? d2_val : -d2_val) * (is_call ? 1.0 : -1.0);
+
+    // Same for calls and puts (spot delta, so vanna carries the foreign discount factor)
+    result.vanna = -d_foreign * norm_pdf(d1_val) * d2_val / vol;
+    result.volga = result.vega * d1_val * d2_val / vol;
 
     return result;
 }
