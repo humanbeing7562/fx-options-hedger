@@ -24,6 +24,9 @@ class Portfolio {
 public:
     int add_option(const Position& pos);
     void remove_option(int position_id);
+    // Change a position's notional (used to net legs together); 0 removes it.
+    // Throws if the id isn't in the book.
+    void set_notional(int position_id, double notional);
     void add_spot_hedge(double amount, double rate);
 
     // Totals across all live options (expired ones are skipped)

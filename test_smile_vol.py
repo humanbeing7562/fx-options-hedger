@@ -122,8 +122,9 @@ result = pricer.price(spot, 6.70, q["T"], vol, True)
 print(f"\n3M call at 6.70: smile vol {vol*100:.4f}%  price {result.price:.6f}  delta {result.delta:.4f}")
 
 # ---- 7. Wings and arbitrage, every snapshot and tenor ----
-# Past the 10P / 10C strikes VV continues its slope and levels off (unchecked, first-order
-# VV reached ~49% vol 5% out on 1W; holding it flat instead created butterfly arbitrage).
+# The default surface is the hybrid: VV inside 25D, SABR in the wings, a cubic bridge
+# between. SABR wings keep rising far out, so the wing check is Lee's moment bound -
+# total variance must grow slower than 2 x |log-moneyness| - rather than a fixed vol cap.
 from statistics import NormalDist
 _N = NormalDist().cdf
 
@@ -137,6 +138,7 @@ def undiscounted_call(F, K, T, vol):
 join_jump = 0.0
 join_kink = 0.0
 highest_wing = 0.0
+lee_worst = 0.0
 butterfly_bad = 0
 calendar_bad = 0
 smiles_checked = 0
@@ -159,7 +161,9 @@ for ts in market.snapshot_times():
             join_kink = max(join_kink, abs(slope_in - slope_out))
         # (b) bounded far out
         for mult in [0.5, 0.8, 1.25, 2.0]:
-            highest_wing = max(highest_wing, surface.get_vol(F * mult, T))
+            v = surface.get_vol(F * mult, T)
+            highest_wing = max(highest_wing, v)
+            lee_worst = max(lee_worst, v * v * T / abs(math.log(mult)))
         # (c) butterfly: call prices convex in strike (fine grid near the joins + wide grid)
         points = []
         for k in [s.k_10p, s.k_10c]:
@@ -189,11 +193,52 @@ for ts in market.snapshot_times():
                 calendar_bad += 1
             previous = w
 
-if join_jump > 1e-6 or join_kink > 1e-3 or highest_wing > 0.20 or butterfly_bad > 0 or calendar_bad > 0:
+if join_jump > 1e-6 or join_kink > 1e-3 or lee_worst >= 2.0 or butterfly_bad > 0 or calendar_bad > 0:
     problems += 1
 print(f"\n7. {smiles_checked} smiles: join jump {join_jump:.1e}, slope change at join {join_kink:.1e}; "
-      f"highest vol out to F x 0.5 / 2.0 {highest_wing*100:.2f}%")
+      f"highest vol out to F x 0.5 / 2.0 {highest_wing*100:.2f}%, "
+      f"wing total variance / |log-moneyness| at most {lee_worst:.4f} (Lee bound: < 2)")
 print(f"   butterfly arbitrage in {butterfly_bad} smiles; calendar arbitrage in {calendar_bad} checks")
+
+# ---- 8. The hybrid picks VV or SABR by strike ----
+# VV inside 25D (exact at 25P / ATM / 25C), SABR past the bridge end (10D unless that
+# would make negative density), a cubic bridge between them.
+hybrid_bad = 0
+miss_10d = []
+ends = {}
+for ts in market.snapshot_times()[::10]:
+    hybrid = market.get_smile_vol(ts)
+    vv_only = market.get_smile_vol(ts, model="vv")
+    sabr_only = market.get_smile_vol(ts, model="sabr")
+    if hybrid.model() != "hybrid":
+        hybrid_bad += 1
+    for i in range(len(hybrid.tenors())):
+        s = hybrid.tenors()[i]
+        # inside 25D: identical to VV, weight 0
+        for K in [s.k_25p, 0.5 * (s.k_25p + s.k_atm), s.k_atm, 0.5 * (s.k_atm + s.k_25c), s.k_25c]:
+            if hybrid.tenor_vol(i, K) != vv_only.tenor_vol(i, K) or hybrid.sabr_weight(i, K) != 0.0:
+                hybrid_bad += 1
+        # past the bridge ends: identical to SABR, weight 1
+        for K in [s.k_put_end * 0.999, s.k_put_end * 0.99, s.k_call_end * 1.001, s.k_call_end * 1.01]:
+            if hybrid.tenor_vol(i, K) != sabr_only.tenor_vol(i, K) or hybrid.sabr_weight(i, K) != 1.0:
+                hybrid_bad += 1
+        # bridge ends at or beyond 10D, and passed the density check
+        if s.k_put_end > s.k_10p * (1 + 1e-12) or s.k_call_end < s.k_10c * (1 - 1e-12) or not s.arbitrage_free:
+            hybrid_bad += 1
+        for d in [s.put_end_delta, s.call_end_delta]:
+            ends[d] = ends.get(d, 0) + 1
+        miss_10d.append(abs(hybrid.tenor_vol(i, s.k_10p) - s.vol_10p))
+        miss_10d.append(abs(hybrid.tenor_vol(i, s.k_10c) - s.vol_10c))
+miss_10d.sort()
+median_miss = miss_10d[len(miss_10d) // 2]
+if hybrid_bad > 0 or median_miss > 0.0005:
+    problems += 1
+ends_text = []
+for d in sorted(ends, reverse=True):
+    ends_text.append(f"{d*100:.0f}D: {ends[d]}")
+print(f"\n8. hybrid: VV inside 25D, SABR past the bridge, mismatches {hybrid_bad}; "
+      f"10D quotes missed by {median_miss*100:.3f} vol (median)")
+print(f"   bridge ends: {', '.join(ends_text)}")
 
 print()
 print("ALL CHECKS PASSED" if problems == 0 else f"{problems} PROBLEMS")

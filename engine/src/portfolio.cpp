@@ -1,4 +1,6 @@
 #include "portfolio.hpp"
+#include <stdexcept>
+#include <string>
 
 // Bucket edges match the tenor day counts used everywhere else
 // (1W = 7, 1M = 30, 3M = 91, 6M = 182 days), so a 3M option lands in the 3M bucket.
@@ -27,6 +29,20 @@ void Portfolio::remove_option(int position_id) {
             return;
         }
     }
+}
+
+void Portfolio::set_notional(int position_id, double notional) {
+    for (auto it = options_.begin(); it != options_.end(); ++it) {
+        if (it->id == position_id) {
+            if (notional == 0.0) {
+                options_.erase(it);
+            } else {
+                it->notional = notional;
+            }
+            return;
+        }
+    }
+    throw std::invalid_argument("no position with id " + std::to_string(position_id));
 }
 
 void Portfolio::add_spot_hedge(double amount, double rate) {

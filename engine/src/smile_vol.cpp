@@ -2,6 +2,8 @@
 #include "pricer.hpp"
 #include <ql/termstructures/volatility/sabr.hpp>
 #include <ql/math/interpolations/sabrinterpolation.hpp>
+#include <ql/math/distributions/normaldistribution.hpp>
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -150,6 +152,191 @@ double SabrSmile::vol(double strike) const {
 }
 
 // ======================================================================
+// HybridSmile
+// ======================================================================
+
+double hybrid_sabr_weight(double strike, double k_end_p, double k_25p, double k_25c, double k_end_c) {
+    if (strike >= k_25p && strike <= k_25c) {
+        return 0.0;
+    }
+    if (strike <= k_end_p || strike >= k_end_c) {
+        return 1.0;
+    }
+    if (strike < k_25p) {
+        return std::log(k_25p / strike) / std::log(k_25p / k_end_p);
+    }
+    return std::log(strike / k_25c) / std::log(k_end_c / k_25c);
+}
+
+// Slope of a smile in log-strike, by central difference
+static double log_slope(const Smile& smile, double strike) {
+    double h = 1e-6;
+    double up = smile.vol(strike * std::exp(h));
+    double down = smile.vol(strike * std::exp(-h));
+    return (up - down) / (2.0 * h);
+}
+
+double HybridSmile::Bridge::vol(double x) const {
+    // Cubic Hermite on t in [0, 1]; slopes are per unit log-strike, so scale by the length
+    double length = x1 - x0;
+    double t = (x - x0) / length;
+    double t2 = t * t;
+    double t3 = t2 * t;
+    double h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    double h10 = t3 - 2.0 * t2 + t;
+    double h01 = -2.0 * t3 + 3.0 * t2;
+    double h11 = t3 - t2;
+    return h00 * v0 + h10 * length * slope0 + h01 * v1 + h11 * length * slope1;
+}
+
+void HybridSmile::Bridge::derivatives(double x, double& v, double& dv, double& d2v) const {
+    double length = x1 - x0;
+    double t = (x - x0) / length;
+    double t2 = t * t;
+    double t3 = t2 * t;
+
+    // Hermite basis and its derivatives in t
+    double h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    double h10 = t3 - 2.0 * t2 + t;
+    double h01 = -2.0 * t3 + 3.0 * t2;
+    double h11 = t3 - t2;
+    double h00_t = 6.0 * t2 - 6.0 * t;
+    double h10_t = 3.0 * t2 - 4.0 * t + 1.0;
+    double h01_t = -6.0 * t2 + 6.0 * t;
+    double h11_t = 3.0 * t2 - 2.0 * t;
+    double h00_tt = 12.0 * t - 6.0;
+    double h10_tt = 6.0 * t - 4.0;
+    double h01_tt = -12.0 * t + 6.0;
+    double h11_tt = 6.0 * t - 2.0;
+
+    double m0 = length * slope0;
+    double m1 = length * slope1;
+    v = h00 * v0 + h10 * m0 + h01 * v1 + h11 * m1;
+    dv = (h00_t * v0 + h10_t * m0 + h01_t * v1 + h11_t * m1) / length;
+    d2v = (h00_tt * v0 + h10_tt * m0 + h01_tt * v1 + h11_tt * m1) / (length * length);
+}
+
+bool HybridSmile::density_ok(const Bridge& bridge) const {
+    // In log-moneyness y = ln(K / F) with total variance w = vol^2 * T:
+    //   g(y) = (1 - y w' / (2w))^2 - (w'^2 / 4)(1/w + 1/4) + w'' / 2
+    // The density is >= 0 exactly where g >= 0 (Gatheral, "The Volatility Surface", ch. 2).
+    // vol'' of the cubic is a straight line in t, so its most extreme values are at the two
+    // ends - both ends are always in the sample.
+    double floor = 0.001;
+    int n = 400;
+    for (int j = 0; j <= n; j++) {
+        double x = bridge.x0 + (bridge.x1 - bridge.x0) * j / n;
+        double v, dv, d2v;
+        bridge.derivatives(x, v, dv, d2v);
+        if (v < floor) {
+            return false;            // the floor would put a kink in the smile
+        }
+        double y = x - std::log(forward_);
+        double w = v * v * T_;
+        double w1 = 2.0 * v * dv * T_;
+        double w2 = 2.0 * (dv * dv + v * d2v) * T_;
+        double a = 1.0 - y * w1 / (2.0 * w);
+        double g = a * a - 0.25 * w1 * w1 * (1.0 / w + 0.25) + 0.5 * w2;
+        if (g < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+double HybridSmile::side_vol(const Bridge& bridge, bool is_call, double strike) const {
+    bool inside;
+    bool past_end;
+    if (is_call) {
+        inside = strike <= k_25c_;
+        past_end = strike >= bridge.k_end;
+    } else {
+        inside = strike >= k_25p_;
+        past_end = strike <= bridge.k_end;
+    }
+    if (inside) {
+        return vv_->vol(strike);
+    }
+    if (past_end) {
+        return sabr_->vol(strike);
+    }
+    double result = bridge.vol(std::log(strike));
+    double floor = 0.001;
+    if (result < floor) {
+        result = floor;
+    }
+    return result;
+}
+
+HybridSmile::Bridge HybridSmile::build_bridge(bool is_call, double k_25, double k_10) const {
+    // Candidate end points: the quoted 10D strike first, then further out
+    std::vector<double> deltas = {0.10, 0.08, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01};
+
+    // Strikes for the deeper deltas: Black forward delta at the SABR vol of the 10D strike
+    // (only used to space the candidates out - the 10D one is the quoted strike itself)
+    double sd = sabr_->vol(k_10) * std::sqrt(T_);
+    QuantLib::InverseCumulativeNormal inverse_normal;
+
+    Bridge bridge;
+    for (size_t i = 0; i < deltas.size(); i++) {
+        double k_end = k_10;
+        if (i > 0) {
+            double z = inverse_normal(deltas[i]);
+            if (is_call) {
+                k_end = forward_ * std::exp(-z * sd + 0.5 * sd * sd);
+            } else {
+                k_end = forward_ * std::exp(z * sd + 0.5 * sd * sd);
+            }
+        }
+
+        bridge.x0 = std::log(k_25);
+        bridge.x1 = std::log(k_end);
+        bridge.v0 = vv_->vol(k_25);
+        bridge.v1 = sabr_->vol(k_end);
+        bridge.slope0 = log_slope(*vv_, k_25);
+        bridge.slope1 = log_slope(*sabr_, k_end);
+        bridge.k_end = k_end;
+        bridge.end_delta = deltas[i];
+
+        bool convex = density_ok(bridge);
+        bridge.convex = convex;
+        if (convex) {
+            return bridge;
+        }
+    }
+    return bridge;    // the deepest candidate, flagged as not convex
+}
+
+HybridSmile::HybridSmile(std::shared_ptr<const Smile> vv, std::shared_ptr<const Smile> sabr,
+                         double k_10p, double k_25p, double k_25c, double k_10c,
+                         double forward, double T)
+    : vv_(vv), sabr_(sabr), k_25p_(k_25p), k_25c_(k_25c), forward_(forward), T_(T) {
+
+    if (!vv_ || !sabr_) {
+        throw std::invalid_argument("hybrid smile needs both a VV and a SABR smile");
+    }
+    if (!(k_10p < k_25p && k_25p < k_25c && k_25c < k_10c)) {
+        throw std::invalid_argument("hybrid strikes must be ordered 10P < 25P < 25C < 10C");
+    }
+    if (forward_ <= 0 || T_ <= 0) {
+        throw std::invalid_argument("hybrid smile needs a positive forward and T");
+    }
+
+    put_side_ = build_bridge(false, k_25p_, k_10p);
+    call_side_ = build_bridge(true, k_25c_, k_10c);
+}
+
+double HybridSmile::vol(double strike) const {
+    if (strike <= 0) {
+        throw std::invalid_argument("strike must be positive");
+    }
+    if (strike < k_25p_) {
+        return side_vol(put_side_, false, strike);
+    }
+    return side_vol(call_side_, true, strike);
+}
+
+// ======================================================================
 // calibrate_sabr
 // ======================================================================
 
@@ -204,8 +391,8 @@ SmileVol::SmileVol(double spot,
                    const std::string& model)
     : model_(model), spot_(spot) {
 
-    if (model_ != "vv" && model_ != "sabr") {
-        throw std::invalid_argument("model must be \"vv\" or \"sabr\", got \"" + model_ + "\"");
+    if (model_ != "hybrid" && model_ != "vv" && model_ != "sabr") {
+        throw std::invalid_argument("model must be \"hybrid\", \"vv\" or \"sabr\", got \"" + model_ + "\"");
     }
     if (quotes.size() == 0) {
         throw std::invalid_argument("SmileVol needs at least one tenor");
@@ -251,11 +438,15 @@ SmileVol::SmileVol(double spot,
         s.vol_10c = q.vol_10c;
 
         // Smile model for this tenor
-        if (model_ == "vv") {
-            s.smile = std::make_shared<VannaVolgaSmile>(s.k_25p, s.k_atm, s.k_25c,
-                                                        s.vol_25p, s.vol_atm, s.vol_25c,
-                                                        s.k_10p, s.k_10c, s.T);
-        } else {
+        std::shared_ptr<const Smile> vv_smile;
+        std::shared_ptr<const Smile> sabr_smile;
+
+        if (model_ == "vv" || model_ == "hybrid") {
+            vv_smile = std::make_shared<VannaVolgaSmile>(s.k_25p, s.k_atm, s.k_25c,
+                                                         s.vol_25p, s.vol_atm, s.vol_25c,
+                                                         s.k_10p, s.k_10c, s.T);
+        }
+        if (model_ == "sabr" || model_ == "hybrid") {
             std::vector<double> strikes = {s.k_10p, s.k_25p, s.k_atm, s.k_25c, s.k_10c};
             std::vector<double> vols = {s.vol_10p, s.vol_25p, s.vol_atm, s.vol_25c, s.vol_10c};
 
@@ -271,8 +462,23 @@ SmileVol::SmileVol(double spot,
 
             s.sabr = calibrate_sabr(strikes, vols, s.forward, s.T, 1.0,
                                     start_alpha, start_rho, start_nu);
-            s.smile = std::make_shared<SabrSmile>(s.forward, s.T, s.sabr.alpha,
-                                                  s.sabr.beta, s.sabr.rho, s.sabr.nu);
+            sabr_smile = std::make_shared<SabrSmile>(s.forward, s.T, s.sabr.alpha,
+                                                     s.sabr.beta, s.sabr.rho, s.sabr.nu);
+        }
+
+        if (model_ == "vv") {
+            s.smile = vv_smile;
+        } else if (model_ == "sabr") {
+            s.smile = sabr_smile;
+        } else {
+            std::shared_ptr<HybridSmile> hybrid = std::make_shared<HybridSmile>(
+                vv_smile, sabr_smile, s.k_10p, s.k_25p, s.k_25c, s.k_10c, s.forward, s.T);
+            s.put_end_delta = hybrid->put_end_delta();
+            s.call_end_delta = hybrid->call_end_delta();
+            s.k_put_end = hybrid->put_end_strike();
+            s.k_call_end = hybrid->call_end_strike();
+            s.arbitrage_free = hybrid->arbitrage_free();
+            s.smile = hybrid;
         }
         smiles_.push_back(s);
     }
@@ -283,6 +489,20 @@ double SmileVol::tenor_vol(size_t index, double strike) const {
         throw std::out_of_range("tenor index out of range");
     }
     return smiles_[index].smile->vol(strike);
+}
+
+double SmileVol::sabr_weight(size_t index, double strike) const {
+    if (index >= smiles_.size()) {
+        throw std::out_of_range("tenor index out of range");
+    }
+    if (model_ == "vv") {
+        return 0.0;
+    }
+    if (model_ == "sabr") {
+        return 1.0;
+    }
+    const TenorSmile& s = smiles_[index];
+    return hybrid_sabr_weight(strike, s.k_put_end, s.k_25p, s.k_25c, s.k_call_end);
 }
 
 double SmileVol::forward(double T) const {

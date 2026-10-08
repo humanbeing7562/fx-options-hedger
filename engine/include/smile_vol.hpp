@@ -62,6 +62,65 @@ private:
     double nu_;
 };
 
+// The surface the desk uses: VV where the market is liquid, SABR in the deep wings.
+//   between 25P and 25C     -> vanna-volga (exact at 25P / ATM / 25C)
+//   past the bridge end     -> SABR fitted to all 5 pillars
+//   from 25D to bridge end  -> a cubic in log-strike that starts at VV's vol AND slope at
+//                              25D and ends at SABR's vol AND slope at the end (Hermite),
+//                              so there is no jump or kink at either join
+// The bridge ends at 10D whenever that is arbitrage-free (93% of smile sides in the
+// Jul-Sep data). VV reaches 25D with a steep slope; when the market's 10D is much flatter,
+// bending into SABR by 10D makes negative density, so the end moves out one step at a time
+// (8D, 6D, 5D, 4D, 3D, 2D, 1D) until the density along the bridge is >= 0 everywhere.
+// The switch is by STRIKE: the 25D and 10D strikes are where those deltas sit, and
+// switching on the option's own delta would be circular (delta needs the vol).
+//
+// 0 inside 25D, 1 past the bridge end, in between = how far along the bridge (log-strike)
+double hybrid_sabr_weight(double strike, double k_end_p, double k_25p, double k_25c, double k_end_c);
+
+class HybridSmile : public Smile {
+public:
+    static constexpr double FIRST_END_DELTA = 0.10;
+
+    HybridSmile(std::shared_ptr<const Smile> vv, std::shared_ptr<const Smile> sabr,
+                double k_10p, double k_25p, double k_25c, double k_10c,
+                double forward, double T);
+    double vol(double strike) const override;
+
+    // Where each bridge ended (strike and delta) and whether it passed the convexity check
+    double put_end_strike() const { return put_side_.k_end; }
+    double call_end_strike() const { return call_side_.k_end; }
+    double put_end_delta() const { return put_side_.end_delta; }
+    double call_end_delta() const { return call_side_.end_delta; }
+    bool arbitrage_free() const { return put_side_.convex && call_side_.convex; }
+
+private:
+    // One join: cubic from (x0, v0, slope0) at 25D to (x1, v1, slope1) at the end, x = log-strike
+    struct Bridge {
+        double x0 = 0, x1 = 0, v0 = 0, v1 = 0, slope0 = 0, slope1 = 0;
+        double k_end = 0, end_delta = 0;
+        bool convex = false;
+        double vol(double x) const;
+        // vol and its first two derivatives in log-strike, in closed form
+        void derivatives(double x, double& v, double& dv, double& d2v) const;
+    };
+
+    // Butterfly check on a bridge: the risk-neutral density, written with Gatheral's
+    // g(y) in total variance, must be >= 0 everywhere along it (both ends included)
+    bool density_ok(const Bridge& bridge) const;
+
+    Bridge build_bridge(bool is_call, double k_25, double k_10) const;
+    // Vol on one side of the smile (ATM outwards) with the given bridge
+    double side_vol(const Bridge& bridge, bool is_call, double strike) const;
+
+    std::shared_ptr<const Smile> vv_;
+    std::shared_ptr<const Smile> sabr_;
+    double k_25p_, k_25c_;
+    double forward_, T_;
+    Bridge put_side_;
+    Bridge call_side_;
+};
+
 // Result of fitting SABR to one tenor's quotes
 struct SabrFit {
     double alpha = 0.0;
@@ -113,25 +172,41 @@ struct TenorSmile {
     double vol_25c;
     double vol_10c;
 
-    // SABR fit for this tenor (only filled in when model = "sabr")
+    // SABR fit for this tenor (filled in when model = "sabr" or "hybrid")
     SabrFit sabr;
+
+    // Hybrid only: where the VV -> SABR bridges ended (0.10 = at 10D as quoted)
+    double put_end_delta = 0.0;
+    double call_end_delta = 0.0;
+    double k_put_end = 0.0;
+    double k_call_end = 0.0;
+    bool arbitrage_free = true;
 
     // The smile model for this tenor
     std::shared_ptr<const Smile> smile;
 };
 
+// The vol surface at one snapshot.
+//   - constructor: deltas -> strikes for every tenor, builds one Smile per tenor
+//     model = "hybrid" -> HybridSmile: VV inside 25D, SABR past 10D, blended between (default)
+//     model = "vv"     -> VannaVolgaSmile only (kept for comparison)
+//     model = "sabr"   -> SABR only, fitted here to all 5 pillars (QuantLib), beta fixed at 1
+//   - get_vol(K, T): that tenor's Smile, blended in total variance between tenors
 class SmileVol : public VolProvider {
 public:
     SmileVol(double spot,
              const YieldCurve& domestic,     // CNY
              const YieldCurve& foreign,      // USD
              const std::vector<TenorQuote>& quotes,
-             const std::string& model = "vv");
+             const std::string& model = "hybrid");
+
 
     double get_vol(double strike, double T) const override;
 
     // One tenor's own smile (VV or SABR), WITHOUT the calendar floor - for tests and plots
     double tenor_vol(size_t index, double strike) const;
+
+    double sabr_weight(size_t index, double strike) const;
 
     // Forward for any maturity: log-linear between the tenor forwards (spot at T = 0)
     double forward(double T) const;

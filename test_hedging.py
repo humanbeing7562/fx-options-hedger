@@ -391,12 +391,24 @@ def fixed_strike_vol_pnl(b, dv):
 
 
 print("11c. full revaluation, hedged vs unhedged (CNY):")
+# Measured against the book's real spot exposure - the larger of the two unhedged moves.
+# (One direction alone can be small just because the positions offset there.)
+# What's left after hedging is third-order, plus a little gamma: a single-expiry bucket
+# gets only the 3x3, and gamma = vega / (S^2 sigma T) holds per strike, so with a smile
+# about 0.5% of that bucket's gamma survives.
+spot_moves = {}
 for label, spot_mult in [("spot +0.5%", 1.005), ("spot -0.5%", 0.995)]:
     shocked = fxengine.MarketSnapshot(snap.time(), spot * spot_mult, cny_s, usd_s, base_surface)
     h = stress_hedged.nav(shocked) - stress_hedged.nav(snap)
     u = stress_unhedged.nav(shocked) - stress_unhedged.nav(snap)
-    check(abs(h) < 0.02 * abs(u), f"{label}: hedge should remove ~all of the P&L")
-    print(f"      {label:<26} unhedged {u:>12,.0f}   hedged {h:>10,.0f}")
+    spot_moves[label] = (u, h)
+exposure = 0.0
+for label in spot_moves:
+    exposure = max(exposure, abs(spot_moves[label][0]))
+for label in spot_moves:
+    u, h = spot_moves[label]
+    check(abs(h) < 0.01 * exposure, f"{label}: hedge should remove ~all of the P&L")
+    print(f"      {label:<26} unhedged {u:>12,.0f}   hedged {h:>10,.0f}   ({abs(h) / exposure * 100:.2f}% of exposure)")
 for label, dv in [("vols +0.20 at fixed strikes", 0.002), ("vols -0.20 at fixed strikes", -0.002)]:
     h = fixed_strike_vol_pnl(stress_hedged, dv)
     u = fixed_strike_vol_pnl(stress_unhedged, dv)

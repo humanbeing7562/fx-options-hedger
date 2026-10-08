@@ -19,6 +19,11 @@ OVERNIGHT = 1.0 / 365.0
 # floating-point rounding can't leave it alive at its own expiry fixing.
 EXPIRY_TOL = 1e-9
 
+# Netting: legs count as identical if strike and expiry agree this closely, and a
+# merged notional this small (USD) counts as zero
+NET_TOL = 1e-12
+NET_ZERO = 1e-6
+
 
 class Book:
     def __init__(self):
@@ -143,6 +148,59 @@ class Book:
             "cash_cny": cash_change,
             "note": note,
         })
+
+    def net_positions(self, position_ids, time=None):
+        """
+        Merges options among `position_ids` that have the same strike, expiry and
+        call/put into one position (the oldest id keeps the summed notional).
+        A merge that sums to zero removes the position. No cash moves: two options
+        with identical terms are the same risk, so NAV and Greeks don't change.
+        Returns {merged id: surviving id or None if it netted to zero}.
+        """
+        wanted = set(position_ids)
+        groups = []          # each: {"keep": id, "strike", "expiry", "is_call", "total", "ids": [...]}
+        for pos in self.portfolio.get_options():
+            if pos.id not in wanted:
+                continue
+            found = None
+            for group in groups:
+                if (group["is_call"] == pos.is_call
+                        and abs(group["strike"] - pos.strike) <= NET_TOL
+                        and abs(group["expiry"] - pos.expiry) <= NET_TOL):
+                    found = group
+                    break
+            if found is None:
+                groups.append({"keep": pos.id, "strike": pos.strike, "expiry": pos.expiry,
+                               "is_call": pos.is_call, "total": pos.notional, "ids": [pos.id]})
+            else:
+                found["total"] += pos.notional
+                found["ids"].append(pos.id)
+
+        merged = {}
+        for group in groups:
+            if len(group["ids"]) < 2:
+                continue
+            total = group["total"]
+            if abs(total) < NET_ZERO:
+                total = 0.0
+            keep = group["keep"]
+            self.portfolio.set_notional(keep, total)
+            for position_id in group["ids"][1:]:
+                self.portfolio.set_notional(position_id, 0.0)
+            survivor = keep if total != 0.0 else None
+            for position_id in group["ids"]:
+                if position_id != survivor:
+                    merged[position_id] = survivor
+            self.trades.append({
+                "type": "net",
+                "time": time,
+                "position_ids": group["ids"],
+                "kept_id": survivor,
+                "notional": total,
+                "cash_cny": 0.0,
+                "note": "netted identical legs",
+            })
+        return merged
 
     def accrue(self, snapshot, dt):
         """

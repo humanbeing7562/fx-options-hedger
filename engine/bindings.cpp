@@ -71,6 +71,9 @@ PYBIND11_MODULE(fxengine, m) {
              py::arg("forward"), py::arg("T"), py::arg("alpha"),
              py::arg("beta"), py::arg("rho"), py::arg("nu"));
 
+    m.def("hybrid_sabr_weight", &hybrid_sabr_weight, py::arg("strike"),
+          py::arg("k_end_p"), py::arg("k_25p"), py::arg("k_25c"), py::arg("k_end_c"));
+
     py::class_<SabrFit>(m, "SabrFit")
         .def_readonly("alpha", &SabrFit::alpha)
         .def_readonly("beta", &SabrFit::beta)
@@ -107,15 +110,21 @@ PYBIND11_MODULE(fxengine, m) {
         .def_readonly("vol_atm", &TenorSmile::vol_atm)
         .def_readonly("vol_25c", &TenorSmile::vol_25c)
         .def_readonly("vol_10c", &TenorSmile::vol_10c)
-        .def_readonly("sabr", &TenorSmile::sabr);
+        .def_readonly("sabr", &TenorSmile::sabr)
+        .def_readonly("put_end_delta", &TenorSmile::put_end_delta)
+        .def_readonly("call_end_delta", &TenorSmile::call_end_delta)
+        .def_readonly("k_put_end", &TenorSmile::k_put_end)
+        .def_readonly("k_call_end", &TenorSmile::k_call_end)
+        .def_readonly("arbitrage_free", &TenorSmile::arbitrage_free);
 
     py::class_<SmileVol, VolProvider>(m, "SmileVol")
         .def(py::init<double, const YieldCurve&, const YieldCurve&,
                       const std::vector<TenorQuote>&, const std::string&>(),
              py::arg("spot"), py::arg("domestic"), py::arg("foreign"),
-             py::arg("quotes"), py::arg("model") = "vv")
+             py::arg("quotes"), py::arg("model") = "hybrid")
         .def("tenors", &SmileVol::tenors, py::return_value_policy::reference_internal)
         .def("tenor_vol", &SmileVol::tenor_vol, py::arg("index"), py::arg("strike"))
+        .def("sabr_weight", &SmileVol::sabr_weight, py::arg("index"), py::arg("strike"))
         .def("forward", &SmileVol::forward, py::arg("T"))
         .def("model", &SmileVol::model);
 
@@ -150,6 +159,7 @@ PYBIND11_MODULE(fxengine, m) {
         .def(py::init<>())
         .def("add_option", &Portfolio::add_option, py::arg("position"))
         .def("remove_option", &Portfolio::remove_option, py::arg("position_id"))
+        .def("set_notional", &Portfolio::set_notional, py::arg("position_id"), py::arg("notional"))
         .def("add_spot_hedge", &Portfolio::add_spot_hedge, py::arg("amount"), py::arg("rate"))
         .def("aggregate_greeks", &Portfolio::aggregate_greeks, py::arg("market"))
         .def("greeks_by_expiry", &Portfolio::greeks_by_expiry, py::arg("market"))

@@ -138,11 +138,12 @@ class MarketLoader:
                 raise ValueError(f"{tenor} at {timestamp} has {len(quotes[tenor]['vols'])} pillars, expected 5")
         return quotes
 
-    def get_smile_vol(self, timestamp, model="vv"):
+    def get_smile_vol(self, timestamp, model="hybrid"):
         """
         Builds the C++ SmileVol (vol surface) for one snapshot.
-        model = "vv"   -> vanna-volga through 25P / ATM / 25C
-        model = "sabr" -> SABR, fitted to all 5 pillars inside C++ (QuantLib)
+        model = "hybrid" -> VV inside 25D, SABR past 10D, blended between (the desk's surface)
+        model = "vv"     -> vanna-volga only, through 25P / ATM / 25C (for comparison)
+        model = "sabr"   -> SABR only, fitted to all 5 pillars inside C++ (QuantLib)
         Python only packs the quotes; strikes and the smile are done in C++.
         """
         timestamp = pd.Timestamp(timestamp)
@@ -164,7 +165,7 @@ class MarketLoader:
 
         return fxengine.SmileVol(spot, cny, usd, tenor_quotes, model)
 
-    def get_snapshot(self, timestamp, sim_start, model="vv"):
+    def get_snapshot(self, timestamp, sim_start, model="hybrid"):
         """
         Builds the C++ MarketSnapshot for one fixing: spot, both curves, vol surface.
         Its time is years since sim_start - the same clock position expiries use.
