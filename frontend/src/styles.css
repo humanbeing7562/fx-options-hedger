@@ -410,7 +410,6 @@ button.close {
 
 .intro {
   color: var(--muted);
-  max-width: 680px;
   margin-bottom: 20px;
 }
 
