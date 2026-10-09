@@ -165,6 +165,21 @@ class MarketLoader:
 
         return fxengine.SmileVol(spot, cny, usd, tenor_quotes, model)
 
+    def get_market(self, timestamp, model="hybrid"):
+        """
+        The pieces of the market at one fixing, as a dict:
+            {"spot", "cny" (curve), "usd" (curve), "surface" (SmileVol)}
+        The P&L decomposer mixes pieces from two fixings, so it needs them separately.
+        """
+        timestamp = pd.Timestamp(timestamp)
+        cny, usd = self.get_curves(timestamp)
+        return {
+            "spot": self.get_spot(timestamp),
+            "cny": cny,
+            "usd": usd,
+            "surface": self.get_smile_vol(timestamp, model),
+        }
+
     def get_snapshot(self, timestamp, sim_start, model="hybrid"):
         """
         Builds the C++ MarketSnapshot for one fixing: spot, both curves, vol surface.
@@ -176,10 +191,9 @@ class MarketLoader:
             raise ValueError(f"{timestamp} is before the sim start {sim_start}")
 
         time = years_between(sim_start, timestamp)
-        spot = self.get_spot(timestamp)
-        cny, usd = self.get_curves(timestamp)
-        surface = self.get_smile_vol(timestamp, model)
-        return fxengine.MarketSnapshot(time, spot, cny, usd, surface)
+        market = self.get_market(timestamp, model)
+        return fxengine.MarketSnapshot(time, market["spot"], market["cny"], market["usd"],
+                                       market["surface"])
 
     def get_vol_quote(self, timestamp, tenor, pillar):
         timestamp = pd.Timestamp(timestamp)

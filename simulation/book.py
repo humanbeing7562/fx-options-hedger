@@ -310,6 +310,22 @@ class Book:
         self.check_settled(snapshot)
         return self.portfolio.aggregate_greeks(snapshot).delta + self.hedge_usd
 
+    def position_terms(self):
+        """
+        The terms of every option on the book (no pricing), as plain dicts.
+        Used to keep a copy of the book before a step changes it.
+        """
+        result = []
+        for pos in self.portfolio.get_options():
+            result.append({
+                "position_id": pos.id,
+                "strike": pos.strike,
+                "expiry": pos.expiry,
+                "is_call": pos.is_call,
+                "notional": pos.notional,
+            })
+        return result
+
     def positions(self, snapshot):
         """Each live option with its current mid value and Greeks."""
         self.check_settled(snapshot)

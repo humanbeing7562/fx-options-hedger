@@ -200,12 +200,13 @@ public:
              const std::vector<TenorQuote>& quotes,
              const std::string& model = "hybrid");
 
-
     double get_vol(double strike, double T) const override;
 
     // One tenor's own smile (VV or SABR), WITHOUT the calendar floor - for tests and plots
     double tenor_vol(size_t index, double strike) const;
 
+    // Which part of the hybrid a strike falls in, for one tenor:
+    // 0 = VV (inside 25D), 1 = SABR (past the bridge end), in between = how far along the bridge
     double sabr_weight(size_t index, double strike) const;
 
     // Forward for any maturity: log-linear between the tenor forwards (spot at T = 0)

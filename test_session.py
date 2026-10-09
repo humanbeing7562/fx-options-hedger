@@ -158,6 +158,63 @@ check(raises(atmf.submit_order, {"side": "buy", "is_call": True, "notional": 1e6
 print(f"3b. ATMF 3M: strike = forward {F:.5f} (DNS ATM {dns:.5f}, {(dns - F) * 1e4:.1f} pips higher); "
       f"call = put = {call_row['mid']:.6f}; pending ATMF uses the booking fixing's forward")
 
+# ---- 3c. Client vs hedge orders: the tag decides whose side "side" is ----
+tg = Session(market=market, policy="manual")
+terms = {"is_call": True, "notional": 5e6, "strike": 6.80, "expiry": "2026-08-07 10:00"}
+client_buy = tg.submit_order(dict(terms, side="buy"))                     # client buys -> we sell
+hedge_buy = tg.submit_order(dict(terms, side="buy", tag="hedge"))         # we buy
+check(client_buy["tag"] == "client" and client_buy["our_side"] == "sell", "default tag is client; client buy = our sell")
+check(hedge_buy["tag"] == "hedge" and hedge_buy["our_side"] == "buy", "hedge order: side is our side")
+notionals = {}
+for pos in tg.book.portfolio.get_options():
+    notionals[pos.id] = pos.notional
+check(notionals[client_buy["position_id"]] == -5e6 and notionals[hedge_buy["position_id"]] == 5e6,
+      f"client buy books -5m, hedge buy books +5m: {notionals}")
+# Same terms, opposite sides: the options cancel exactly
+g = tg.book.greeks(tg.snapshot)
+check(abs(g["option_delta"]) < 1e-6 and abs(g["vega"]) < 1e-6 and abs(g["gamma"]) < 1e-6,
+      "a hedge buy against a client buy of the same option leaves no option risk")
+check(abs(tg.book.nav(tg.snapshot)) < 1e-6, "both at mid: NAV still 0")
+sources = {}
+for row in tg.state()["positions"]:
+    sources[row["position_id"]] = row["source"]
+check(sources[client_buy["position_id"]] == "client" and sources[hedge_buy["position_id"]] == "hedge",
+      "state() shows who each position is with")
+notes = []
+for trade in tg.blotter():
+    if trade["type"] == "option":
+        notes.append(trade["note"])
+check("client order #1: client buys" in notes and "hedge order #2: we buy" in notes, f"blotter notes: {notes}")
+# A second identical hedge leg nets into the first; the client leg is never netted
+hedge_buy_2 = tg.submit_order(dict(terms, side="buy", tag="hedge"))
+left = {}
+for pos in tg.book.portfolio.get_options():
+    left[pos.id] = pos.notional
+check(left == {client_buy["position_id"]: -5e6, hedge_buy["position_id"]: 10e6},
+      f"identical hedge legs merge (client leg untouched): {left}")
+check(abs(tg.book.nav(tg.snapshot)) < 1e-6, "netting leaves NAV unchanged")
+# Pending hedge order books later, still as a hedge
+pending_hedge = tg.submit_order({"time": "2026-07-07 12:30", "side": "sell", "tag": "hedge", "is_call": False,
+                                 "notional": 2e6, "tenor_days": 30, "strike": "25D"})
+check(pending_hedge["status"] == "pending" and pending_hedge["our_side"] == "sell", "pending hedge order waits")
+tg.run(until="2026-07-07 14:00")
+booked_hedge = tg.orders[-1]
+check(booked_hedge["status"] == "booked" and booked_hedge["position_id"] in tg.hedge_ids,
+      "a pending hedge order books as a hedge")
+for pos in tg.book.portfolio.get_options():
+    if pos.id == booked_hedge["position_id"]:
+        check(pos.notional == -2e6, "hedge sell books -2m")
+# Quotes: a client deals on our bid/ask; on a hedge we pay the market's ask and hit its bid
+q_cb = tg.quote(dict(terms, side="buy", tag="client"))
+q_cs = tg.quote(dict(terms, side="sell", tag="client"))
+q_hb = tg.quote(dict(terms, side="buy", tag="hedge"))
+q_hs = tg.quote(dict(terms, side="sell", tag="hedge"))
+check(q_cb["our_price"] == q_cb["ask"] and q_cs["our_price"] == q_cs["bid"], "client buys at our ask, sells at our bid")
+check(q_hb["our_price"] == q_hb["ask"] and q_hs["our_price"] == q_hs["bid"], "hedge: we buy at the ask, sell at the bid")
+check(raises(tg.submit_order, dict(terms, side="buy", tag="prop")), "unknown tag refused")
+print("3c. tag: client buy -> -5m, hedge buy -> +5m, same option cancels to zero risk; state/blotter show the tag; "
+      "identical hedge legs net, client legs don't; quotes take the right side")
+
 # ---- 4. Cancel + quote ----
 pending = s.submit_order({"time": "2026-07-08 10:00", "side": "buy", "is_call": True,
                           "notional": 1e6, "tenor_days": 14})
@@ -437,6 +494,131 @@ check(s.snapshot.time() > 0 and s.times[0] == pd.Timestamp("2026-09-24 10:00"), 
 check(raises(Session, None, None, "hedge_everything"), "unknown policy refused")
 check(raises(Session, "2026-12-01", None), "no fixings in range refused")
 print(f"10. session from 24 Sep: {len(s.times)} fixings, NAV {s.book.nav(s.snapshot):,.0f} CNY; bad policy / empty range refused")
+
+# ---- 11. Inputs that used to slip through (found in review) ----
+s = Session(market=market, policy="manual")
+bad = 0
+for field, value in [("notional", float("nan")), ("notional", float("inf")), ("price", float("nan")),
+                     ("strike", float("nan")), ("tenor_days", float("inf")), ("tenor_days", -3)]:
+    order = {"side": "buy", "is_call": True, "notional": 1e6, "tenor_days": 7}
+    order[field] = value
+    if raises(s.submit_order, order):
+        bad += 1
+check(bad == 6, f"NaN / infinity / negative tenor must be refused ({bad} of 6)")
+check(raises(Session, None, None, "threshold", {"delta_usd": float("nan")}, market), "a NaN limit is refused")
+check(raises(s.submit_order, {"side": "buy", "is_call": True, "notional": 1e6,
+                              "expiry": "2026-07-07 10:00:30"}), "expiry under a minute after the order is refused")
+check(raises(s.submit_order, {"side": "buy", "is_call": True, "notional": 1e6, "tenor_days": 7, "time": "not a time"}),
+      "a non-date time is refused")
+check(len(s.orders) == 0 and len(s.book.portfolio.get_options()) == 0, "refused orders leave no trace")
+# times with a timezone are converted to Beijing time (the fixings' clock)
+row = s.submit_order({"side": "buy", "is_call": True, "notional": 1e6, "tenor_days": 7,
+                      "time": "2026-07-07T02:00:00Z"})             # = 10:00 Beijing
+check(row["status"] == "booked" and row["booked_at"] == "2026-07-07T10:00:00", "UTC time converted to Beijing time")
+tz_session = Session(market=market, start="2026-07-08T02:00:00Z", end="2026-07-08 16:00")
+check(tz_session.now() == pd.Timestamp("2026-07-08 10:00"), "a session start with a timezone works")
+tz_session.run(until="2026-07-08T06:00:00Z")                        # = 14:00 Beijing
+check(tz_session.now() == pd.Timestamp("2026-07-08 14:00"), "run(until=...) with a timezone works")
+check(raises(tz_session.run, -1), "negative steps refused")
+# a pending order that would expire seconds after its booking fixing is rejected cleanly, not half-booked
+s = Session(market=market, policy="manual")
+s.submit_order({"side": "buy", "is_call": True, "notional": 1e6, "time": "2026-07-07 10:30",
+                "expiry": "2026-07-07 11:00:00.010"})
+step = s.next()                                                     # 11:00: 10 ms before expiry
+check(step["orders_booked"][0]["status"] == "rejected" and len(s.book.portfolio.get_options()) == 0,
+      "an order 10 ms from expiry at its booking fixing is rejected, the step completes")
+# a booking that fails takes the order back out, so order ids stay 1, 2, 3...
+s = Session(market=market, policy="manual")
+real_book_option = s.book.book_option
+
+
+def failing_book_option(*args, **kwargs):
+    raise ValueError("simulated booking failure")
+
+
+s.book.book_option = failing_book_option
+check(raises(s.submit_order, {"side": "buy", "is_call": True, "notional": 1e6, "tenor_days": 7}), "booking failure raises")
+s.book.book_option = real_book_option
+row = s.submit_order({"side": "buy", "is_call": True, "notional": 1e6, "tenor_days": 7})
+check(row["order_id"] == 1 and len(s.orders) == 1, "a failed booking leaves no ghost order; the next order is #1")
+print("11. NaN / infinity / bad times refused; timezones converted; a near-expiry pending order is rejected "
+      "cleanly; a failed booking leaves no ghost order")
+
+# ---- 12. Hedge plans can only confirm, never set, what is booked ----
+import copy
+s = Session(market=market, policy="manual")
+s.submit_order({"side": "buy", "is_call": True, "notional": 10e6, "tenor_days": 30})
+s.submit_order({"side": "buy", "is_call": False, "notional": 10e6, "tenor_days": 91, "strike": "25D"})
+plan = s.recommend_hedge()
+trades_before = len(s.book.trades)
+# edited prices are ignored: the hedge books at this fixing's own mids, so NAV doesn't move
+cheap = copy.deepcopy(plan)
+for item in cheap["buckets"]:
+    for kind in item.get("packages", {}):
+        for leg in item["packages"][kind]["legs"]:
+            leg["mid"] = 0.0
+nav_before = s.book.nav(s.snapshot)
+s2 = Session(market=market, policy="manual")        # same book, to test the edited plan on
+s2.submit_order({"side": "buy", "is_call": True, "notional": 10e6, "tenor_days": 30})
+s2.submit_order({"side": "buy", "is_call": False, "notional": 10e6, "tenor_days": 91, "strike": "25D"})
+s2.hedge(cheap)
+check(abs(s2.book.nav(s2.snapshot)) < 1e-4, f"zeroed mids must not create P&L, NAV {s2.book.nav(s2.snapshot):,.2f}")
+# edited sizes, junk buckets, missing buckets, and a plan made before the book changed: nothing booked
+edited = copy.deepcopy(plan)
+for item in edited["buckets"]:
+    for kind in item.get("packages", {}):
+        item["packages"][kind]["notional"] *= 2
+junk = copy.deepcopy(plan)
+junk["buckets"].append({"bucket": "junk"})
+no_buckets = {"time": plan["time"]}
+refused = 0
+for bad_plan in [edited, junk, no_buckets, {"buckets": []}, "not a plan"]:
+    if raises(s.hedge, bad_plan):
+        refused += 1
+check(refused == 5 and len(s.book.trades) == trades_before, f"edited / malformed plans refused before booking ({refused} of 5)")
+s.submit_order({"side": "sell", "is_call": True, "notional": 5e6, "tenor_days": 60})     # the book changes
+check(raises(s.hedge, plan), "a plan made before the book changed is refused")
+fresh = s.recommend_hedge()
+s.hedge(fresh)
+check(abs(s.book.net_delta(s.snapshot)) < 1e-3, "a current plan books normally")
+print("12. hedge plans: edited prices are ignored (booked at mid, NAV 0); edited sizes, junk, missing parts and "
+      "out-of-date plans are refused before anything is booked")
+
+# ---- 13. Spot trades and the market screen ----
+s = Session(policy="manual", market=market)
+spot = s.snapshot.spot()
+row = s.trade_spot({"side": "buy", "notional": 2e6, "price": spot + 0.0010})       # client buys at +10 pips
+check(row["our_side"] == "sell" and abs(row["edge_cny"] - 2000.0) < 1e-6, "client spot buy: we sell, 10 pips x 2m = 2,000 edge")
+check(abs(s.book.nav(s.snapshot) - 2000.0) < 1e-6 and abs(s.book.hedge_usd + 2e6) < 1e-6, "NAV = edge, short 2m USD")
+row = s.trade_spot({"side": "sell", "notional": 2e6, "tag": "hedge"})               # we sell 2m more, at mid
+check(row["our_side"] == "sell" and row["edge_cny"] == 0.0 and abs(s.book.hedge_usd + 4e6) < 1e-6, "hedge side is ours")
+for bad in [{"side": "buy", "notional": -1}, {"side": "up", "notional": 1e6}, {"side": "buy", "notional": 1e6, "price": 0},
+            {"side": "buy", "notional": 1e6, "tag": "friend"}, {"side": "buy", "notional": float("nan")}]:
+    check(raises(s.trade_spot, bad), f"refused: {bad}")
+check(abs(s.pnl_summary()["trading"] - 2000.0) < 1e-6, "spot edge counts as trading P&L")
+
+s_eod = Session(policy="end_of_day", market=market)
+s_eod.trade_spot({"side": "buy", "notional": 5e6})
+check(abs(s_eod.book.net_delta(s_eod.snapshot)) < 1e-6, "end_of_day policy flattens delta after a client spot trade")
+s_eod.trade_spot({"side": "buy", "notional": 5e6, "tag": "hedge"})
+check(abs(s_eod.book.net_delta(s_eod.snapshot) - 5e6) < 1e-6, "a hedge trade is left as it is (no policy run)")
+
+view = s.market_view()
+snap = s.snapshot
+for tenor in view["tenors"]:
+    for pillar in tenor["pillars"]:
+        T = tenor["days"] / 365.0
+        # VV inside 25D goes through the quotes exactly; the 10D wings come from the SABR fit
+        # (or the bridge to it), which is close to the 10D quotes but not forced through them
+        gap = abs(snap.vol(pillar["strike"], T) - pillar["vol"])
+        if pillar["pillar"] in ["25P", "ATM", "25C"]:
+            check(gap < 1e-6, f"{tenor['tenor']} {pillar['pillar']}: surface returns the quoted vol")
+        else:
+            check(gap < 0.0015, f"{tenor['tenor']} {pillar['pillar']}: surface within 0.15 vol pt of the quote ({gap:.5f})")
+    check(abs(tenor["forward"] - snap.forward(tenor["days"] / 365.0)) < 1e-6, f"{tenor['tenor']} forward matches the snapshot")
+json.dumps(view, allow_nan=False)
+print(f"13. spot trades: sides, edge, NAV and policy as expected; market screen: {len(view['tenors'])} tenors, "
+      f"ATM / 25D vols exact, 10D within 0.15 vol pt (SABR wing), forwards agree")
 
 print()
 print("ALL CHECKS PASSED" if problems == 0 else f"{problems} PROBLEMS")

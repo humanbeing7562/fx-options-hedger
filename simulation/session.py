@@ -27,14 +27,19 @@ Rules: no prints, no input, no globals. Everything returned is a plain dict of
 str / float / int / bool / None / list, so it can go straight to JSON.
 The clock only moves forward. Dates live here; C++ only sees years since the start.
 """
+import math
 import pandas as pd
 import fxengine
 
 from simulation.market_loader import MarketLoader, years_between
-from simulation.book import Book
+from simulation.book import Book, EXPIRY_TOL
 from simulation.hedging import recommend_bucketed_hedge, bucket_of, BUCKETS
+from simulation.pnl import decompose_step, STAGES
 
 POLICIES = ["end_of_day", "threshold", "manual"]
+TAGS = ["client", "hedge"]
+# Quoted vol tenors by their day count
+TENOR_LABELS = {7: "1W", 14: "2W", 21: "3W", 30: "1M", 61: "2M", 91: "3M", 182: "6M", 273: "9M", 365: "1Y"}
 DEFAULT_LIMITS = {
     "delta_usd": 1e6,                # hedge delta when |net delta| is above this (USD)
     "vega_cny_per_volpt": 50_000,    # smile-hedge when a bucket's |vega| per 1 vol point is above this
@@ -44,6 +49,45 @@ DEFAULT_HALF_SPREAD_VOL = 0.0010
 # Hedge packages smaller than this (USD) aren't worth trading
 MIN_HEDGE_NOTIONAL = 1.0
 SECONDS_PER_YEAR = 365.0 * 24 * 3600
+# The fixings are Beijing time with no timezone attached; a time sent WITH a timezone
+# (e.g. "2026-07-07T02:00:00Z") is converted to Beijing time first
+CLOCK_TZ = "Asia/Shanghai"
+# An option must live at least this long after it is ordered
+MIN_LIFE = pd.Timedelta(minutes=1)
+# A hedge plan sent back must match the one recommended now to this relative precision
+PLAN_TOL = 1e-9
+
+
+def clock_time(value, what):
+    """A timestamp on the session's clock (Beijing time, no timezone). Refuses non-dates."""
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError):
+        raise ValueError(f"{what}: {value!r} is not a date/time") from None
+    if pd.isna(ts):
+        raise ValueError(f"{what}: {value!r} is not a date/time")
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(CLOCK_TZ).tz_localize(None)
+    return ts
+
+
+def finite_number(value, what):
+    """A plain float; refuses text, NaN and infinity (they would poison every later sum)."""
+    if isinstance(value, bool):
+        raise ValueError(f"{what} must be a number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what} must be a number") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{what} must be a finite number")
+    return number
+
+
+def close_enough(a, b):
+    if isinstance(a, bool) or not isinstance(a, (int, float)):
+        return False
+    return abs(a - b) <= PLAN_TOL * max(1.0, abs(b))
 
 
 class Session:
@@ -61,14 +105,20 @@ class Session:
             for name in limits:
                 if name not in self.limits:
                     raise ValueError(f"unknown limit {name!r}")
-                self.limits[name] = float(limits[name])
+                self.limits[name] = finite_number(limits[name], f"limit {name}")
 
         # The fixings this session walks through
+        start_ts = None
+        end_ts = None
+        if start is not None:
+            start_ts = clock_time(start, "start")
+        if end is not None:
+            end_ts = clock_time(end, "end")
         self.times = []
         for t in market.snapshot_times():
-            if start is not None and t < pd.Timestamp(start):
+            if start_ts is not None and t < start_ts:
                 continue
-            if end is not None and t > pd.Timestamp(end):
+            if end_ts is not None and t > end_ts:
                 continue
             self.times.append(t)
         if len(self.times) == 0:
@@ -108,8 +158,12 @@ class Session:
         return ts.round("s")
 
     def _build_snapshot(self, index):
-        # The vol surface picks its own model by strike (VV inside 25D, SABR in the wings)
-        return self.market.get_snapshot(self.times[index], sim_start=self.start)
+        # The vol surface picks its own model by strike (VV inside 25D, SABR in the wings).
+        # The pieces are kept too: the P&L decomposer mixes this fixing's and the next one's.
+        self.market_now = self.market.get_market(self.times[index])
+        m = self.market_now
+        return fxengine.MarketSnapshot(self.years(self.times[index]), m["spot"], m["cny"], m["usd"],
+                                       m["surface"])
 
     def _is_end_of_day(self):
         if self.done():
@@ -122,7 +176,12 @@ class Session:
             raise ValueError("no more fixings - the session has reached its end")
 
         previous_snapshot = self.snapshot
+        previous_market = self.market_now
         previous_time = self.now()
+        # The book as it stands before anything in this step changes it (for the P&L explain)
+        positions_before = self.book.position_terms()
+        hedge_before = self.book.hedge_usd
+        cash_before = self.book.cash_cny
 
         # 1. clock
         self.index += 1
@@ -131,16 +190,22 @@ class Session:
 
         # 2. interest over the gap, at the rates in force when the gap began
         carry = self.book.accrue(previous_snapshot, dt)
+        hedge_after = self.book.hedge_usd
+        cash_after = self.book.cash_cny
 
         # 3. expiries
         settled = self.book.settle_expired(self.snapshot)
         for row in settled:
             self.hedge_ids.discard(row["position_id"])
 
-        # 4. mark
+        # 4. mark, and explain the move by full revaluation (stages add up to market_pnl)
         nav_marked = self.book.nav(self.snapshot)
         market_pnl = nav_marked - self.last_nav
         self.last_nav = nav_marked
+        explain = decompose_step(positions_before,
+                                 {"time": previous_snapshot.time(), "market": previous_market},
+                                 {"time": self.snapshot.time(), "market": self.market_now},
+                                 hedge_before, cash_before, hedge_after, cash_after)
 
         # 5. client orders that are due
         booked = []
@@ -161,6 +226,7 @@ class Session:
             "dt_hours": dt * 365 * 24,
             "carry_cny": carry,
             "market_pnl_cny": market_pnl,
+            "pnl_explain": explain,
             "settled": self._settled_rows(settled),
             "orders_booked": booked,
             "hedges": hedges,
@@ -173,12 +239,17 @@ class Session:
 
     def run(self, steps=None, until=None):
         """Call next() `steps` times, or until the clock reaches `until`. Returns the step records."""
+        until_ts = None
+        if until is not None:
+            until_ts = clock_time(until, "until")
+        if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int) or steps < 0):
+            raise ValueError("steps must be a whole number, 0 or more")
         records = []
         count = 0
         while not self.done():
             if steps is not None and count >= steps:
                 break
-            if until is not None and self.times[self.index + 1] > pd.Timestamp(until):
+            if until_ts is not None and self.times[self.index + 1] > until_ts:
                 break
             records.append(self.next())
             count += 1
@@ -191,7 +262,9 @@ class Session:
     def _parse_order(self, order):
         """
         Checks a client order and fills in its times.
-            side        "buy" or "sell" - what the CLIENT does
+            tag         "client" (default) or "hedge" - who the trade is with
+            side        "buy" or "sell". For a client order: what the CLIENT does
+                        (client buys -> we sell). For a hedge order: what WE do.
             is_call     True / False
             notional    USD, positive
             strike      a number, "ATM" (delta-neutral straddle), "ATMF" (the forward to
@@ -200,19 +273,17 @@ class Session:
             time        when the client asks (default: now); booked at the first fixing >= time
             price       optional agreed premium (CNY per USD); default = mid at booking
         """
-        side = order.get("side")
-        if side not in ["buy", "sell"]:
-            raise ValueError("side must be 'buy' or 'sell' (what the client does)")
+        tag, side, our_side = self._sides(order)
         if "is_call" not in order or not isinstance(order["is_call"], bool):
             raise ValueError("is_call must be true or false")
-        notional = float(order.get("notional", 0))
+        notional = finite_number(order.get("notional", 0), "notional")
         if notional <= 0:
             raise ValueError("notional must be positive (USD)")
 
         if order.get("time") is None:
             order_time = self.now()
         else:
-            order_time = pd.Timestamp(order["time"])
+            order_time = clock_time(order["time"], "time")
         if order_time < self.now():
             raise ValueError(f"order time {order_time} is before the clock ({self.now()}) - "
                              f"the clock only moves forward")
@@ -220,13 +291,16 @@ class Session:
             raise ValueError(f"order time {order_time} is after the last fixing")
 
         if order.get("expiry") is not None:
-            expiry_time = pd.Timestamp(order["expiry"])
+            expiry_time = clock_time(order["expiry"], "expiry")
         elif order.get("tenor_days") is not None:
-            expiry_time = order_time + pd.Timedelta(days=float(order["tenor_days"]))
+            tenor_days = finite_number(order["tenor_days"], "tenor_days")
+            if tenor_days <= 0:
+                raise ValueError("tenor_days must be positive")
+            expiry_time = order_time + pd.Timedelta(days=tenor_days)
         else:
             raise ValueError("give expiry or tenor_days")
-        if expiry_time <= order_time:
-            raise ValueError("expiry must be after the order time")
+        if expiry_time < order_time + MIN_LIFE:
+            raise ValueError("expiry must be at least a minute after the order time")
 
         strike = order.get("strike", "ATM")
         if isinstance(strike, str):
@@ -234,23 +308,25 @@ class Session:
             if text != "ATM" and text != "ATMF":
                 if not text.endswith("D"):
                     raise ValueError("strike must be a number, 'ATM', 'ATMF' or like '25D'")
-                delta = float(text[:-1])
+                delta = finite_number(text[:-1], "delta strike")
                 if delta <= 0 or delta >= 100:
                     raise ValueError("delta strike must be between 0D and 100D")
             strike = text
         else:
-            strike = float(strike)
+            strike = finite_number(strike, "strike")
             if strike <= 0:
                 raise ValueError("strike must be positive")
 
         price = order.get("price")
         if price is not None:
-            price = float(price)
+            price = finite_number(price, "price")
             if price < 0:
                 raise ValueError("price must not be negative")
 
         return {
+            "tag": tag,
             "side": side,
+            "our_side": our_side,
             "is_call": order["is_call"],
             "notional": notional,
             "strike": strike,
@@ -258,6 +334,28 @@ class Session:
             "expiry": expiry_time,
             "price": price,
         }
+
+    def _sides(self, order):
+        """
+        (tag, side, our_side) of an order or spot trade. For a client trade `side` is what
+        the CLIENT does (client buys -> we sell); for a hedge it is what WE do.
+        """
+        tag = order.get("tag", "client")
+        if tag not in TAGS:
+            raise ValueError(f"tag must be one of {TAGS}")
+        side = order.get("side")
+        if side not in ["buy", "sell"]:
+            raise ValueError("side must be 'buy' or 'sell' (client trade: the client's side; "
+                             "hedge trade: our side)")
+        # Our side of the trade, so nothing downstream has to know the convention
+        if tag == "client":
+            if side == "buy":
+                our_side = "sell"
+            else:
+                our_side = "buy"
+        else:
+            our_side = side
+        return tag, side, our_side
 
     def _resolve_strike(self, strike, T, is_call):
         if not isinstance(strike, str):
@@ -295,13 +393,24 @@ class Session:
         bid = pricer.price(spot, strike, T, bid_vol, o["is_call"]).price
         ask = pricer.price(spot, strike, T, ask_vol, o["is_call"]).price
 
-        if o["side"] == "buy":
-            our_price = ask
+        # bid / ask around mid: a client buys from us at the ask and sells to us at the bid;
+        # on a hedge we deal with the market, so we buy at the ask and sell at the bid.
+        # Either way: our buy is at the ask only for a hedge, our sell at the ask only for a client.
+        if o["tag"] == "client":
+            if o["our_side"] == "sell":
+                our_price = ask
+            else:
+                our_price = bid
         else:
-            our_price = bid
+            if o["our_side"] == "buy":
+                our_price = ask
+            else:
+                our_price = bid
         return {
             "time": self.now().isoformat(),
+            "tag": o["tag"],
             "side": o["side"],
+            "our_side": o["our_side"],
             "is_call": o["is_call"],
             "notional": o["notional"],
             "strike": strike,
@@ -335,7 +444,13 @@ class Session:
 
         if o["time"] <= self.now():
             nav_before = self.book.nav(self.snapshot)
-            row = self._book_order(o)
+            try:
+                row = self._book_order(o)
+            except Exception:
+                # Nothing was booked: take the order back out, so ids stay 1, 2, 3, ...
+                self.orders.remove(o)
+                self.order_count -= 1
+                raise
             hedges = self._apply_policy()
             nav_after = self.book.nav(self.snapshot)
             self._record({
@@ -351,6 +466,69 @@ class Session:
         self.pending.append(o)
         return self._order_row(o)
 
+    def trade_spot(self, order):
+        """
+        A spot USD/CNY trade at this fixing, booked straight away.
+            tag       "client" (default) or "hedge"
+            side      client trade: what the CLIENT does; hedge trade: what WE do
+            notional  USD, positive
+            price     optional, CNY per USD; default = this fixing's spot (mid)
+        Our USD position and CNY cash change; edge = our USD x (spot - price), so buying
+        below spot or selling above it shows as trading P&L. After a client trade the
+        hedge policy runs (manual: nothing; end_of_day: delta is flattened).
+        """
+        tag, side, our_side = self._sides(order)
+        notional = finite_number(order.get("notional", 0), "notional")
+        if notional <= 0:
+            raise ValueError("notional must be positive (USD)")
+        spot = self.snapshot.spot()
+        price = order.get("price")
+        if price is None:
+            price = spot
+        else:
+            price = finite_number(price, "price")
+            if price <= 0:
+                raise ValueError("price must be positive")
+        if our_side == "buy":
+            our_usd = notional
+        else:
+            our_usd = -notional
+
+        nav_before = self.book.nav(self.snapshot)
+        if tag == "client":
+            note = f"client spot: client {side}s"
+        else:
+            note = f"hedge spot: we {our_side}"
+        self.book.trade_spot(our_usd, price, time=self.snapshot.time(), note=note)
+        row = {
+            "type": "spot",
+            "tag": tag,
+            "side": side,
+            "our_side": our_side,
+            "notional": notional,
+            "usd_amount": our_usd,
+            "spot": spot,
+            "price": price,
+            "cash_cny": -our_usd * price,
+            "edge_cny": our_usd * (spot - price),
+        }
+        hedges = None
+        if tag == "client":
+            hedges = self._apply_policy()
+        nav_after = self.book.nav(self.snapshot)
+        self._record({"type": "spot", "trade": row, "hedges": hedges,
+                      "trade_pnl_cny": nav_after - nav_before, "nav_cny": nav_after})
+        self.last_nav = nav_after
+        row["time"] = self.now().isoformat()
+        return row
+
+    def order_rows(self):
+        """Every order submitted to this session (pending, booked, cancelled, rejected), oldest first."""
+        rows = []
+        for o in self.orders:
+            rows.append(self._order_row(o))
+        return rows
+
     def cancel_order(self, order_id):
         for o in self.pending:
             if o["order_id"] == order_id:
@@ -364,7 +542,7 @@ class Session:
         now = self.snapshot.time()
         expiry = self.years(o["expiry"])
         T = expiry - now
-        if T <= 0:
+        if T <= EXPIRY_TOL:          # the Book treats anything this close to expiry as expired
             o["status"] = "rejected"
             o["reason"] = "expired before it could be booked"
             return self._order_row(o)
@@ -375,15 +553,19 @@ class Session:
         if price is None:
             price = mid
 
-        # Our side is the opposite of the client's
-        if o["side"] == "buy":
-            our_notional = -o["notional"]
-        else:
+        if o["our_side"] == "buy":
             our_notional = o["notional"]
+        else:
+            our_notional = -o["notional"]
 
-        note = f"client order #{o['order_id']}: client {o['side']}s"
+        if o["tag"] == "client":
+            note = f"client order #{o['order_id']}: client {o['side']}s"
+        else:
+            note = f"hedge order #{o['order_id']}: we {o['our_side']}"
         position_id = self.book.book_option(strike, expiry, o["is_call"], our_notional, price,
                                             time=now, note=note)
+        if o["tag"] == "hedge":
+            self.hedge_ids.add(position_id)      # shown as a hedge, and netted with other hedge legs
         o["status"] = "booked"
         o["booked_at"] = self.now()
         o["position_id"] = position_id
@@ -398,7 +580,9 @@ class Session:
         row = {
             "order_id": o["order_id"],
             "status": o["status"],
+            "tag": o["tag"],
             "side": o["side"],
+            "our_side": o["our_side"],
             "is_call": o["is_call"],
             "notional": o["notional"],
             "strike": o["strike"],
@@ -433,16 +617,20 @@ class Session:
 
     def hedge(self, plan=None):
         """
-        Books a smile hedge plan from recommend_hedge() (made at THIS fixing) - or a
-        fresh one if none is given - then flattens delta with spot and nets the legs.
+        Books the recommended smile hedge, then flattens delta with spot and nets the legs.
         Returns what was traded.
+
+        The hedge is always worked out again here, on this fixing's market, and that fresh
+        plan is what gets booked - prices included. A plan passed in (the one a page showed
+        from recommend_hedge) is only a confirmation: it must have been made at this fixing
+        and must still match the fresh plan, or nothing is booked. So a plan that was edited,
+        or made before the book changed, can't book anything.
         """
-        if plan is None:
-            plan = self.recommend_hedge()
-        if plan.get("time") != self.now().isoformat():
-            raise ValueError("this plan was made at another fixing - ask for a new one")
+        fresh = self.recommend_hedge()
+        if plan is not None:
+            self._check_plan(plan, fresh)
         nav_before = self.book.nav(self.snapshot)
-        result = self._hedge_smile(plan)
+        result = self._hedge_smile(fresh)
         result["spot"] = self._hedge_delta()
         result["netted"] = self._net()
         nav_after = self.book.nav(self.snapshot)
@@ -451,6 +639,39 @@ class Session:
         self._record(record)
         self.last_nav = nav_after
         return result
+
+    def _check_plan(self, plan, fresh):
+        """Raises ValueError unless `plan` is the same hedge as `fresh` (same fixing, buckets,
+        packages, notionals and expiries). Checks everything before anything is booked."""
+        changed = "the book or the plan has changed since this plan was made - ask for a new one"
+        if not isinstance(plan, dict) or "time" not in plan:
+            raise ValueError("a hedge plan must be one from recommend_hedge")
+        if plan["time"] != self.now().isoformat():
+            raise ValueError("this plan was made at another fixing - ask for a new one")
+        buckets = plan.get("buckets")
+        if not isinstance(buckets, list) or len(buckets) != len(fresh["buckets"]):
+            raise ValueError(changed)
+        for i in range(len(buckets)):
+            theirs = buckets[i]
+            mine = fresh["buckets"][i]
+            if not isinstance(theirs, dict) or theirs.get("bucket") != mine["bucket"]:
+                raise ValueError(changed)
+            if ("skipped" in theirs) != ("skipped" in mine):
+                raise ValueError(changed)
+            if "packages" not in mine:
+                continue
+            packages = theirs.get("packages")
+            if not isinstance(packages, dict) or set(packages.keys()) != set(mine["packages"].keys()):
+                raise ValueError(changed)
+            for kind in mine["packages"]:
+                p_theirs = packages[kind]
+                p_mine = mine["packages"][kind]
+                if not isinstance(p_theirs, dict):
+                    raise ValueError(changed)
+                if not close_enough(p_theirs.get("notional"), p_mine["notional"]):
+                    raise ValueError(changed)
+                if not close_enough(p_theirs.get("expiry"), p_mine["expiry"]):
+                    raise ValueError(changed)
 
     def hedge_delta(self):
         """Flattens delta with a spot trade. Returns the trade (None if already flat)."""
@@ -525,6 +746,9 @@ class Session:
         """Hedges according to the policy. Returns what was traded."""
         result = {"packages": [], "skipped": [], "spot": None, "netted": 0, "reason": None}
         if self.policy == "manual":
+            # No trading by itself, but identical hedge legs (e.g. from hedge orders) still merge;
+            # netting never changes NAV or Greeks
+            result["netted"] = self._net()
             return result
 
         smile = False
@@ -582,6 +806,60 @@ class Session:
         self.history_log.append(record)
         return record
 
+    def market_view(self):
+        """
+        The market screen at this fixing: spot, overnight rates, and per quoted tenor the
+        forward, forward points, ATM / 25D risk reversal / 25D butterfly, and every pillar's
+        strike, quoted vol, premium and Greeks (priced at the quoted vol with that tenor's rates).
+        The data has vols only; every price and Greek here is the engine's.
+        """
+        snap = self.snapshot
+        spot = snap.spot()
+        tenors = []
+        for s in self.market_now["surface"].tenors():
+            T = s.T
+            days = int(round(T * 365))
+            rd = snap.domestic_rate(T)
+            rf = snap.foreign_rate(T)
+            pricer = fxengine.GKPricer(rd, rf)
+            pillars = []
+            quotes = [("10P", s.k_10p, s.vol_10p, False), ("25P", s.k_25p, s.vol_25p, False),
+                      ("ATM", s.k_atm, s.vol_atm, True), ("25C", s.k_25c, s.vol_25c, True),
+                      ("10C", s.k_10c, s.vol_10c, True)]
+            for name, strike, vol, is_call in quotes:
+                r = pricer.price(spot, strike, T, vol, is_call)
+                pillars.append({
+                    "pillar": name,
+                    "is_call": is_call,
+                    "strike": strike,
+                    "vol": vol,
+                    "price": r.price,
+                    "delta": r.delta,
+                    "gamma": r.gamma,
+                    "vega": r.vega,
+                    "theta": r.theta,
+                })
+            tenors.append({
+                "tenor": TENOR_LABELS.get(days, f"{days}D"),
+                "days": days,
+                "expiry": self.timestamp(snap.time() + T).isoformat(),
+                "forward": s.forward,
+                "forward_points_pips": (s.forward - spot) * 1e4,
+                "rate_cny": rd,
+                "rate_usd": rf,
+                "atm_vol": s.vol_atm,
+                "rr25": s.vol_25c - s.vol_25p,
+                "bf25": 0.5 * (s.vol_25c + s.vol_25p) - s.vol_atm,
+                "pillars": pillars,
+            })
+        return {
+            "time": self.now().isoformat(),
+            "spot": spot,
+            "rate_cny_on": snap.domestic_rate(1.0 / 365),
+            "rate_usd_on": snap.foreign_rate(1.0 / 365),
+            "tenors": tenors,
+        }
+
     def state(self):
         """Everything about the book right now, as plain data."""
         summary = self.book.summary(self.snapshot)
@@ -612,6 +890,32 @@ class Session:
 
     def history(self):
         return list(self.history_log)
+
+    def pnl_summary(self):
+        """
+        P&L since the start, by source: carry / time / spot / rates / vol from every step's
+        explain, plus trading (client edge and anything booked away from mid).
+        These add up to the NAV.
+        """
+        totals = {}
+        for stage in STAGES:
+            totals[stage] = 0.0
+        totals["trading"] = 0.0
+        steps = 0
+        for record in self.history_log:
+            if record["type"] == "step":
+                for stage in STAGES:
+                    totals[stage] += record["pnl_explain"][stage]
+                steps += 1
+            if "trade_pnl_cny" in record:
+                totals["trading"] += record["trade_pnl_cny"]
+        total = 0.0
+        for name in totals:
+            total += totals[name]
+        totals["total"] = total
+        totals["nav_cny"] = self.book.nav(self.snapshot)
+        totals["steps"] = steps
+        return totals
 
     def blotter(self):
         """Every trade the book has made, with timestamps instead of sim-clock years."""
