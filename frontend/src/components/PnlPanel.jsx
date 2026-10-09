@@ -9,10 +9,28 @@
 
 import { dateOf, fmtClock, fmtDay, fmtSigned, pnlClass } from "../format.js";
 
-function Line({ label, value, indent, strong }) {
+// What each line means, shown when hovering the label
+const LINE_HELP = {
+  carry: "Interest earned or paid on CNY cash and the USD spot position over the step.",
+  time: "Change in the options' value from the clock moving forward, with the market unchanged (theta).",
+  spot: "Change in value from the spot move alone, with the new time but the old rates and vols.",
+  delta: "First-order part of the spot P&L: (options' delta + USD position) × spot move.",
+  gamma: "Second-order part: ½ × gamma × (spot move)².",
+  spotOther: "What delta and gamma don't explain (third order and above).",
+  rates: "Change in value from the CNY and USD curves moving.",
+  vol: "Change in value from the vol surface moving, smile included.",
+  vega: "First-order part of the vol P&L: vega × the change in each option's own vol.",
+  volOther: "What vega doesn't explain: second order and above (mostly volga).",
+  total: "Sum of the lines above: the change in NAV from the market move.",
+  trading: "Change in NAV from trades booked at this fixing: your edge against mid (negative if you paid a spread).",
+  tradingTotal: "Edge earned on every trade since the start.",
+  nav: "Net asset value: options at mid + USD position × spot + CNY cash. Starts at 0.",
+};
+
+function Line({ label, value, indent, strong, help }) {
   return (
     <tr className={(indent ? "indent " : "") + (strong ? "strong" : "")}>
-      <td>{label}</td>
+      <td>{help ? <span className="tip" data-tip={help}>{label}</span> : label}</td>
       <td className={"mono " + pnlClass(value)}>{fmtSigned(value)}</td>
     </tr>
   );
@@ -51,17 +69,17 @@ export default function PnlPanel({ history, pnl }) {
           </div>
           <table className="kv pnl">
             <tbody>
-              <Line label="Carry (interest)" value={e.carry} />
-              <Line label="Time (theta)" value={e.time} />
-              <Line label="Spot" value={e.spot} />
-              <Line label="delta" value={e.spot_split.delta} indent />
-              <Line label="gamma" value={e.spot_split.gamma} indent />
-              <Line label="higher order" value={e.spot_split.other} indent />
-              <Line label="Rates" value={e.rates} />
-              <Line label="Vol" value={e.vol} />
-              <Line label="vega" value={e.vol_split.vega} indent />
-              <Line label="smile / higher order" value={e.vol_split.other} indent />
-              <Line label="Market move" value={e.total} strong />
+              <Line label="Carry (interest)" value={e.carry} help={LINE_HELP.carry} />
+              <Line label="Time (theta)" value={e.time} help={LINE_HELP.time} />
+              <Line label="Spot" value={e.spot} help={LINE_HELP.spot} />
+              <Line label="delta" value={e.spot_split.delta} indent help={LINE_HELP.delta} />
+              <Line label="gamma" value={e.spot_split.gamma} indent help={LINE_HELP.gamma} />
+              <Line label="higher order" value={e.spot_split.other} indent help={LINE_HELP.spotOther} />
+              <Line label="Rates" value={e.rates} help={LINE_HELP.rates} />
+              <Line label="Vol" value={e.vol} help={LINE_HELP.vol} />
+              <Line label="vega" value={e.vol_split.vega} indent help={LINE_HELP.vega} />
+              <Line label="smile / higher order" value={e.vol_split.other} indent help={LINE_HELP.volOther} />
+              <Line label="Market move" value={e.total} strong help={LINE_HELP.total} />
             </tbody>
           </table>
           <details>
@@ -97,7 +115,7 @@ export default function PnlPanel({ history, pnl }) {
 
       <table className="kv pnl">
         <tbody>
-          <Line label="Trading at this fixing (edge)" value={tradingNow} strong />
+          <Line label="Trading at this fixing (edge)" value={tradingNow} strong help={LINE_HELP.trading} />
         </tbody>
       </table>
 
@@ -111,8 +129,8 @@ export default function PnlPanel({ history, pnl }) {
               <Line label="Spot" value={pnl.spot} />
               <Line label="Rates" value={pnl.rates} />
               <Line label="Vol" value={pnl.vol} />
-              <Line label="Trading" value={pnl.trading} />
-              <Line label="Total = NAV" value={pnl.total} strong />
+              <Line label="Trading" value={pnl.trading} help={LINE_HELP.tradingTotal} />
+              <Line label="Total = NAV" value={pnl.total} strong help={LINE_HELP.nav} />
             </tbody>
           </table>
         </>

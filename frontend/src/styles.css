@@ -899,3 +899,44 @@ table.data tfoot tr.spot-row td {
 table.data tfoot tr.total-row td {
   border-top: 2px solid var(--line);
 }
+
+/* Labels with a hover explanation */
+.tip {
+  border-bottom: 1px dotted var(--muted);
+  cursor: help;
+}
+
+/* "How it works" box on the first screen */
+.how-it-works ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.how-it-works li {
+  margin-bottom: 6px;
+  line-height: 1.45;
+}
+
+th[data-tip] {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+/* The box HoverTip shows under a [data-tip] label */
+.hover-tip {
+  position: fixed;
+  z-index: 1000;
+  max-width: 280px;
+  padding: 6px 9px;
+  background: var(--text);
+  color: var(--card);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}

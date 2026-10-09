@@ -148,6 +148,36 @@ export default function SessionPicker({ themeToggle, fixings, sessions, busy, me
           </ul>
         </div>
       </div>
+
+      <div className="card how-it-works">
+        <h2>How it works</h2>
+        <ul>
+          <li>
+            <b>The clock.</b> The market only moves when you press <i>Next fixing</i> (or <i>Run to day's close</i>).
+            One step can be an hour, overnight or a whole weekend.
+          </li>
+          <li>
+            <b>Client vs hedge.</b> On the order ticket, "Client buys" means the desk sells. Client trades are
+            priced at your quote, mid, or a vol or premium you agree; your own hedges trade in the market.
+          </li>
+          <li>
+            <b>Risk units.</b> Delta in USD, gamma in USD delta per 100 pips, vega in CNY per vol point,
+            theta in CNY per day. Hover a figure with a dotted underline to see what it means.
+          </li>
+          <li>
+            <b>Hedge suggestions.</b> Spot flattens delta. For each expiry bucket, an ATM straddle, 25D risk
+            reversal and 25D butterfly are sized so vega, vanna and volga go to zero. Suggestions trade at mid.
+          </li>
+          <li>
+            <b>The plan is recomputed after every trade.</b> Book the whole plan in one go, or book the legs
+            you noted down without moving the clock; don't expect the remaining legs to stay the same.
+          </li>
+          <li>
+            <b>P&amp;L.</b> Each move is explained by revaluing the book one input at a time: carry (interest on
+            cash and the USD position), time, spot, rates, vol. The pieces add up exactly.
+          </li>
+        </ul>
+      </div>
     </div>
   );
 }

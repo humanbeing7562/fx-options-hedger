@@ -93,19 +93,19 @@ export default function RiskPanel({ state, limits, onLimitsChange }) {
 
       <div className="greek-cards">
         <div className={"greek " + levelClass(deltaUse)}>
-          <div className="label">Delta</div>
+          <div className="label"><span className="tip" data-tip="USD amount the book is long (+) or short (−), options and spot position together. A 1-pip spot rise changes NAV by delta × 0.0001 CNY.">Delta</span></div>
           <div className="value mono">{fmtSigned(g.delta)}</div>
           <div className="unit">USD · {limitText(limits.delta_usd)}</div>
           <LimitBar fraction={deltaUse} />
         </div>
         <div className={"greek " + levelClass(gammaUse)}>
-          <div className="label">Gamma</div>
+          <div className="label"><span className="tip" data-tip="How much delta changes, in USD, when spot rises 100 pips (0.01). Negative: you get shorter as spot rises, so spot moves either way cost you.">Gamma</span></div>
           <div className="value mono">{fmtSigned(gammaValue)}</div>
           <div className="unit">USD delta per 100 pips spot · {limitText(limits.gamma_usd_per_100pips)}</div>
           <LimitBar fraction={gammaUse} />
         </div>
         <div className={"greek " + levelClass(vegaUse)}>
-          <div className="label">Vega</div>
+          <div className="label"><span className="tip" data-tip="CNY made if every vol rises by one point (e.g. 4.0% to 5.0%). The limit applies to the largest single bucket, not the total.">Vega</span></div>
           <div className="value mono">{fmtSigned(vegaPt(g.vega))}</div>
           <div className="unit">
             CNY per vol pt · worst bucket {worstBucket ? `${worstBucket} ${fmtSigned(worstVega)}` : "–"} · {limitText(limits.vega_cny_per_volpt)}
@@ -113,7 +113,7 @@ export default function RiskPanel({ state, limits, onLimitsChange }) {
           <LimitBar fraction={vegaUse} />
         </div>
         <div className="greek plain">
-          <div className="label">Theta</div>
+          <div className="label"><span className="tip" data-tip="CNY made (+) or lost (−) from one calendar day passing with the market unchanged.">Theta</span></div>
           <div className="value mono">{fmtSigned(thetaDay(g.theta))}</div>
           <div className="unit">CNY per day</div>
         </div>
@@ -124,12 +124,12 @@ export default function RiskPanel({ state, limits, onLimitsChange }) {
         <thead>
           <tr>
             <th>Bucket</th>
-            <th title="option positions">Pos</th>
-            <th title="USD">Delta</th>
-            <th title="USD delta per 100-pip spot move">Gamma 100p</th>
-            <th title="CNY per vol point">Vega</th>
-            <th title="USD delta per vol point (risk reversal risk)">Vanna</th>
-            <th title="CNY vega per vol point, per vol point (butterfly risk)">Volga</th>
+            <th data-tip="option positions">Pos</th>
+            <th data-tip="USD">Delta</th>
+            <th data-tip="USD delta per 100-pip spot move">Gamma 100p</th>
+            <th data-tip="CNY per vol point">Vega</th>
+            <th data-tip="USD delta per vol point (risk reversal risk)">Vanna</th>
+            <th data-tip="CNY vega per vol point, per vol point (butterfly risk)">Volga</th>
           </tr>
         </thead>
         <tbody>
