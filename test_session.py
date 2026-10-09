@@ -620,5 +620,81 @@ json.dumps(view, allow_nan=False)
 print(f"13. spot trades: sides, edge, NAV and policy as expected; market screen: {len(view['tenors'])} tenors, "
       f"ATM / 25D vols exact, 10D within 0.15 vol pt (SABR wing), forwards agree")
 
+# ---- 14. Orders agreed in vol ----
+s = Session(policy="manual", market=market)
+base = {"side": "buy", "is_call": True, "notional": 10e6, "strike": "25D", "tenor_days": 30}
+q = s.quote(base)
+order = dict(base); order["vol"] = q["vol"]
+row = s.submit_order(order)
+check(abs(row["booked_price"] - row["mid"]) < 1e-12 and abs(row["edge_cny"]) < 1e-4, "booked at the mid vol -> the mid premium, no edge")
+check(row["booked_vol"] == q["vol"] and abs(row["mid_vol"] - q["vol"]) < 1e-15, "booked and mid vol recorded")
+order = dict(base); order["vol"] = q["ask_vol"]
+row = s.submit_order(order)
+check(abs(row["booked_price"] - q["ask"]) < 1e-12, "client buys at the ask vol -> exactly the ask premium")
+check(abs(row["edge_cny"] - 10e6 * (q["ask"] - q["mid"])) < 1e-4 and row["edge_cny"] > 0, "edge = notional x (ask - mid)")
+q2 = s.quote(order)
+check(abs(q2["agreed_price"] - q["ask"]) < 1e-12 and abs(q2["agreed_edge_vol"] - 0.001) < 1e-9, "quote prices the agreed vol: +0.10 vol pt to us")
+hedge = dict(base); hedge["tag"] = "hedge"; hedge["vol"] = q["vol"] + 0.002
+check(abs(s.quote(hedge)["agreed_edge_vol"] + 0.002) < 1e-9, "a hedge buying 0.2 pt over mid costs 0.2 pt")
+
+# a waiting order agreed in vol is priced at its booking fixing (spot and rates of that fixing)
+later = dict(base); later["vol"] = 0.025; later["time"] = s.times[2].isoformat()
+s.submit_order(later)
+s.next(); s.next()
+booked = s.order_rows()[-1]
+T = s.years(pd.Timestamp(booked["expiry"])) - s.snapshot.time()
+pricer = fxengine.GKPricer(s.snapshot.domestic_rate(T), s.snapshot.foreign_rate(T))
+expected = pricer.price(s.snapshot.spot(), booked["strike_value"], T, 0.025, True).price
+check(booked["status"] == "booked" and abs(booked["booked_price"] - expected) < 1e-12,
+      "a waiting order agreed in vol books at the booking fixing's spot and rates")
+
+for bad in [0.0, -0.01, 5.0, float("nan"), "2%"]:
+    order = dict(base); order["vol"] = bad
+    check(raises(s.quote, order) and raises(s.submit_order, order), f"vol {bad!r} refused")
+both = dict(base); both["vol"] = 0.02; both["price"] = 0.006
+check(raises(s.submit_order, both), "price and vol together refused")
+json.dumps(s.order_rows(), allow_nan=False)
+print("14. orders agreed in vol: mid vol = mid premium, ask vol = ask premium, waiting orders priced at their "
+      "booking fixing, bad vols and price + vol together refused")
+
+# ---- 15. Sanity bands: no trade at a price nobody would deal ----
+from simulation.session import implied_vol, MAX_VOL_OFF_MID, MAX_SPOT_OFF
+s = Session(policy="manual", market=market)
+base = {"side": "buy", "is_call": True, "notional": 10e6, "strike": "25D", "tenor_days": 30}
+q = s.quote(base)
+T = 30 / 365.0
+pricer = fxengine.GKPricer(s.snapshot.domestic_rate(T), s.snapshot.foreign_rate(T))
+check(abs(implied_vol(pricer, s.snapshot.spot(), q["strike"], T, q["ask"], True) - q["ask_vol"]) < 1e-12,
+      "implied vol of the ask premium is the ask vol")
+check(implied_vol(pricer, s.snapshot.spot(), q["strike"], T, 10.0, True) is None, "a premium above spot (no vol gives it) -> None")
+
+row = s.submit_order(dict(base, price=q["ask"]))
+check(abs(row["booked_vol"] - q["ask_vol"]) < 1e-12, "an order agreed in premium records its implied vol")
+row = s.submit_order(dict(base, vol=q["our_vol"]))
+check(abs(row["booked_price"] - q["our_price"]) < 1e-15, "booking at our_vol gives exactly our_price")
+trades_before = len(s.book.trades)
+orders_before = len(s.orders)
+nav_before = s.book.nav(s.snapshot)
+high = q["vol"] * (1 + MAX_VOL_OFF_MID)
+for bad in [dict(base, price=0.0), dict(base, price=9.9999), dict(base, vol=0.0001),
+            dict(base, vol=high * 1.001), dict(base, price=q["mid"] * 3)]:
+    check(raises(s.submit_order, bad), f"refused: {bad}")
+check(not raises(s.submit_order, dict(base, vol=high * 0.999)), "just inside the band books")
+check(raises(s.quote, dict(base, vol=0.0001)), "the quote refuses an agreed vol outside the band too")
+spot = s.snapshot.spot()
+check(raises(s.trade_spot, {"side": "buy", "notional": 1e6, "price": 67.0}), "spot rate 10x spot refused")
+check(raises(s.trade_spot, {"side": "buy", "notional": 1e6, "price": spot * (1 + MAX_SPOT_OFF) * 1.001}), "spot rate just over 2% refused")
+check(not raises(s.trade_spot, {"side": "buy", "notional": 1e6, "price": spot * (1 + MAX_SPOT_OFF) * 0.999}), "just inside 2% books")
+check(len(s.orders) == orders_before + 1 and s.order_count == len(s.orders), "refused orders leave no trace; ids stay 1, 2, 3")
+
+# a waiting order whose agreed premium is out of the band at its fixing is rejected there, the step goes on
+s.submit_order(dict(base, price=q["mid"] * 3, time=s.times[1].isoformat()))
+step = s.next()
+check(step["orders_booked"][0]["status"] == "rejected" and "outside" in step["orders_booked"][0]["reason"],
+      "a waiting order outside the band is rejected at its fixing with the reason")
+json.dumps(s.order_rows(), allow_nan=False)
+print("15. sanity bands: premiums / vols outside mid vol +-50% and spot rates over 2% from spot refused "
+      "(waiting orders rejected at their fixing); implied vol recorded; our_vol books exactly at our_price")
+
 print()
 print("ALL CHECKS PASSED" if problems == 0 else f"{problems} PROBLEMS")

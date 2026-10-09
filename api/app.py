@@ -115,7 +115,8 @@ class OrderIn(BaseModel):
     expiry: Optional[str] = None         # a timestamp ...
     tenor_days: Optional[Finite] = None  # ... or days from the order time
     time: Optional[str] = None           # default: now
-    price: Optional[Finite] = None       # default: mid at booking
+    price: Optional[Finite] = None       # agreed premium, CNY per USD ...
+    vol: Optional[Finite] = None         # ... or agreed vol (0.0215 = 2.15%); neither: mid at booking
     tag: str = "client"                  # "client" or "hedge"
 
 

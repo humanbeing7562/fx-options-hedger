@@ -56,6 +56,15 @@ CLOCK_TZ = "Asia/Shanghai"
 MIN_LIFE = pd.Timedelta(minutes=1)
 # A hedge plan sent back must match the one recommended now to this relative precision
 PLAN_TOL = 1e-9
+# An agreed vol must be above 0 and below this (5.0 = 500%, far beyond any USD/CNY quote)
+MAX_VOL = 5.0
+MIN_VOL = 1e-4
+# Sanity bands, so a typo can't book a trade nobody would do (the game's P&L would be meaningless):
+#   an option's agreed vol, or the vol implied by its agreed premium, within 50% of the mid vol
+#   either way (mid 2.13% -> 1.07% to 3.20%; a real bid/ask is about 0.1 vol point either side)
+#   a spot rate within 2% of spot (about 1,350 pips; USD/CNY moves ~0.3% on a big day)
+MAX_VOL_OFF_MID = 0.5
+MAX_SPOT_OFF = 0.02
 
 
 def clock_time(value, what):
@@ -82,6 +91,27 @@ def finite_number(value, what):
     if not math.isfinite(number):
         raise ValueError(f"{what} must be a finite number")
     return number
+
+
+def implied_vol(pricer, spot, strike, T, price, is_call):
+    """
+    The vol at which the GK premium equals `price`, by bisection between MIN_VOL and MAX_VOL
+    (the premium rises with vol, so halving the interval 100 times pins it down).
+    None if the price is below the premium at MIN_VOL or above the one at MAX_VOL.
+    """
+    low = MIN_VOL
+    high = MAX_VOL
+    if price < pricer.price(spot, strike, T, low, is_call).price:
+        return None
+    if price > pricer.price(spot, strike, T, high, is_call).price:
+        return None
+    for i in range(100):
+        middle = 0.5 * (low + high)
+        if pricer.price(spot, strike, T, middle, is_call).price < price:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
 
 
 def close_enough(a, b):
@@ -271,7 +301,10 @@ class Session:
                         expiry) or "25D" style (n-delta call or put)
             expiry      a timestamp, or tenor_days instead (counted from the order time)
             time        when the client asks (default: now); booked at the first fixing >= time
-            price       optional agreed premium (CNY per USD); default = mid at booking
+            price       optional agreed premium (CNY per USD)
+            vol         optional agreed vol (0.0215 = 2.15%) instead of a price: the premium is
+                        worked out at booking, at that vol and the booking fixing's spot and rates
+            With neither price nor vol, the order books at mid.
         """
         tag, side, our_side = self._sides(order)
         if "is_call" not in order or not isinstance(order["is_call"], bool):
@@ -323,6 +356,14 @@ class Session:
             if price < 0:
                 raise ValueError("price must not be negative")
 
+        vol = order.get("vol")
+        if vol is not None:
+            if price is not None:
+                raise ValueError("give an agreed price or an agreed vol, not both")
+            vol = finite_number(vol, "vol")
+            if vol <= 0 or vol >= MAX_VOL:
+                raise ValueError("vol must be above 0 and below 5.0 (as a fraction: 0.0215 = 2.15%)")
+
         return {
             "tag": tag,
             "side": side,
@@ -333,6 +374,7 @@ class Session:
             "time": order_time,
             "expiry": expiry_time,
             "price": price,
+            "vol": vol,
         }
 
     def _sides(self, order):
@@ -393,19 +435,34 @@ class Session:
         bid = pricer.price(spot, strike, T, bid_vol, o["is_call"]).price
         ask = pricer.price(spot, strike, T, ask_vol, o["is_call"]).price
 
+        # An agreed vol: the premium it gives at this fixing, and how far it is from mid
+        agreed_price = None
+        agreed_edge_vol = None
+        if o["vol"] is not None:
+            self._check_vol_band(o["vol"], vol)
+            agreed_price = pricer.price(spot, strike, T, o["vol"], o["is_call"]).price
+            if o["our_side"] == "sell":
+                agreed_edge_vol = o["vol"] - vol
+            else:
+                agreed_edge_vol = vol - o["vol"]
+
         # bid / ask around mid: a client buys from us at the ask and sells to us at the bid;
         # on a hedge we deal with the market, so we buy at the ask and sell at the bid.
         # Either way: our buy is at the ask only for a hedge, our sell at the ask only for a client.
         if o["tag"] == "client":
             if o["our_side"] == "sell":
                 our_price = ask
+                our_vol = ask_vol
             else:
                 our_price = bid
+                our_vol = bid_vol
         else:
             if o["our_side"] == "buy":
                 our_price = ask
+                our_vol = ask_vol
             else:
                 our_price = bid
+                our_vol = bid_vol
         return {
             "time": self.now().isoformat(),
             "tag": o["tag"],
@@ -425,7 +482,11 @@ class Session:
             "bid": bid,
             "ask": ask,
             "our_price": our_price,
+            "our_vol": our_vol,                        # the vol behind our_price (send it as "vol" to book at it)
             "premium_cny_at_our_price": our_price * o["notional"],
+            "agreed_vol": o["vol"],
+            "agreed_price": agreed_price,              # premium at the agreed vol (None if no vol given)
+            "agreed_edge_vol": agreed_edge_vol,        # vol points in our favour (+ = we gain)
             "greeks_per_usd": {"delta": mid.delta, "gamma": mid.gamma, "vega": mid.vega,
                                "vanna": mid.vanna, "volga": mid.volga, "theta": mid.theta},
         }
@@ -446,6 +507,8 @@ class Session:
             nav_before = self.book.nav(self.snapshot)
             try:
                 row = self._book_order(o)
+                if o["status"] == "rejected":
+                    raise ValueError(o["reason"])
             except Exception:
                 # Nothing was booked: take the order back out, so ids stay 1, 2, 3, ...
                 self.orders.remove(o)
@@ -489,6 +552,9 @@ class Session:
             price = finite_number(price, "price")
             if price <= 0:
                 raise ValueError("price must be positive")
+            if abs(price / spot - 1.0) > MAX_SPOT_OFF:
+                raise ValueError(f"rate {price:.4f} is more than {MAX_SPOT_OFF:.0%} away from spot "
+                                 f"{spot:.4f} - check for a typo")
         if our_side == "buy":
             our_usd = notional
         else:
@@ -522,6 +588,17 @@ class Session:
         row["time"] = self.now().isoformat()
         return row
 
+    def _check_vol_band(self, vol, mid_vol, what=None):
+        """ValueError unless `vol` is within MAX_VOL_OFF_MID (as a fraction) of the mid vol.
+        `what` names it in the message (default: the vol itself)."""
+        if what is None:
+            what = f"vol {vol:.3%}"
+        low = mid_vol * (1.0 - MAX_VOL_OFF_MID)
+        high = mid_vol * (1.0 + MAX_VOL_OFF_MID)
+        if vol < low or vol > high:
+            raise ValueError(f"{what} is outside {low:.3%} to {high:.3%} (mid {mid_vol:.3%} "
+                             f"\u00b1 {MAX_VOL_OFF_MID:.0%}) - check for a typo")
+
     def order_rows(self):
         """Every order submitted to this session (pending, booked, cancelled, rejected), oldest first."""
         rows = []
@@ -548,10 +625,39 @@ class Session:
             return self._order_row(o)
 
         strike = self._resolve_strike(o["strike"], T, o["is_call"])
+        mid_vol = self.snapshot.vol(strike, T)
         mid = self.snapshot.price(strike, T, o["is_call"]).price
+        # The same pricer and rates as mid, so the mid vol gives exactly the mid premium
+        pricer = fxengine.GKPricer(self.snapshot.domestic_rate(T), self.snapshot.foreign_rate(T))
+        spot = self.snapshot.spot()
         price = o["price"]
-        if price is None:
+        if o["vol"] is not None:
+            # Agreed in vol: the premium at that vol, this fixing's spot and this expiry's rates
+            booked_vol = o["vol"]
+            price = pricer.price(spot, strike, T, booked_vol, o["is_call"]).price
+        elif price is not None:
+            # Agreed premium: the vol it implies (None if no vol gives that premium)
+            booked_vol = implied_vol(pricer, spot, strike, T, price, o["is_call"])
+        else:
             price = mid
+            booked_vol = mid_vol
+
+        problem = None
+        if booked_vol is None:
+            problem = (f"premium {price * 1e4:.1f} pips is outside what any vol gives for this option "
+                       f"(mid {mid * 1e4:.1f} pips)")
+        else:
+            what = None
+            if o["vol"] is None and o["price"] is not None:
+                what = f"premium {price * 1e4:.1f} pips (implied vol {booked_vol:.3%})"
+            try:
+                self._check_vol_band(booked_vol, mid_vol, what)
+            except ValueError as error:
+                problem = str(error)
+        if problem is not None:
+            o["status"] = "rejected"
+            o["reason"] = problem
+            return self._order_row(o)
 
         if o["our_side"] == "buy":
             our_notional = o["notional"]
@@ -571,6 +677,8 @@ class Session:
         o["position_id"] = position_id
         o["strike_value"] = strike
         o["mid"] = mid
+        o["mid_vol"] = mid_vol
+        o["booked_vol"] = booked_vol           # agreed vol, the vol implied by an agreed premium, or mid
         o["booked_price"] = price
         # Day-one P&L: what we gain versus mid (positive when we sold above mid or bought below)
         o["edge_cny"] = -our_notional * (price - mid)
@@ -589,12 +697,15 @@ class Session:
             "time": o["time"].isoformat(),
             "expiry": o["expiry"].isoformat(),
             "price": o["price"],
+            "vol": o["vol"],
         }
         if o["status"] == "booked":
             row["booked_at"] = o["booked_at"].isoformat()
             row["position_id"] = o["position_id"]
             row["strike_value"] = o["strike_value"]
             row["mid"] = o["mid"]
+            row["mid_vol"] = o["mid_vol"]
+            row["booked_vol"] = o["booked_vol"]
             row["booked_price"] = o["booked_price"]
             row["edge_cny"] = o["edge_cny"]
         if "reason" in o:

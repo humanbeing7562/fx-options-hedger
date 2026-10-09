@@ -13,7 +13,7 @@ Checks for the web API (api/app.py).
   7. History paging and delete
   8. Settings from a .env file
   9. For the web page: spot trades (client / hedge sides, edge, NAV), the market screen,
-     the list of fixings, and spot trades surviving a restart (replayed from SQLite)
+     the list of fixings, orders agreed in vol, and both surviving a restart (replayed from SQLite)
 """
 import sys
 import json
@@ -337,8 +337,26 @@ check(after["nav_cny"] == before["nav_cny"] and after["greeks"]["delta"] == befo
       and after["time"] == before["time"], "same NAV, delta and clock after the restart")
 check(c9b.get(f"{S}/blotter").json() == blotter_before, "same blotter after the restart")
 check(abs(after["greeks"]["delta"] - 2e6) < 1e-6, "long 2m after the client sold to us")
+
+# orders agreed in vol: over HTTP, refused shapes, and replayed after a restart
+vol_order = {"side": "buy", "is_call": False, "notional": 3e6, "strike": "25D", "tenor_days": 61}
+qv = c9b.post(f"{S}/quote", json=vol_order).json()
+vol_order["vol"] = qv["ask_vol"]
+booked_v = c9b.post(f"{S}/orders", json=vol_order).json()
+check(abs(booked_v["booked_price"] - qv["ask"]) < 1e-12 and booked_v["booked_vol"] == qv["ask_vol"], "vol order over HTTP books at the ask premium")
+check(c9b.post(f"{S}/orders", content='{"side": "buy", "is_call": true, "notional": 1e6, "tenor_days": 30, "vol": NaN}',
+               headers={"Content-Type": "application/json"}).status_code == 422, "NaN vol -> 422")
+both = dict(vol_order); both["price"] = 0.01
+check(c9b.post(f"{S}/orders", json=both).status_code == 400, "price and vol together -> 400")
+r = c9b.post(f"{S}/spot", json={"side": "buy", "notional": 1e6, "price": 67.0})
+check(r.status_code == 400 and "away from spot" in r.json()["detail"], "spot rate far from spot -> 400 with the reason")
+r = c9b.post(f"{S}/orders", json=dict(vol_order, vol=0.0001))
+check(r.status_code == 400 and "outside" in r.json()["detail"], "vol far from mid -> 400 with the reason")
+orders_before = c9b.get(f"{S}/orders").json()
+c9c = TestClient(create_app(market, admin_key=ADMIN, db_path=spot_db))
+check(c9c.get(f"{S}/orders").json() == orders_before, "vol orders replayed exactly after a restart")
 print(f"9. spot: client buy +5 pips -> edge {t1['edge_cny']:.0f} CNY, hedge flattens it; market screen "
-      f"{len(m9['tenors'])} tenors x 5 pillars at their deltas; {fix['count']} fixings; spot trades replay after a restart")
+      f"{len(m9['tenors'])} tenors x 5 pillars at their deltas; {fix['count']} fixings; spot trades and vol orders replay after a restart")
 
 print()
 print("ALL CHECKS PASSED" if problems == 0 else f"{problems} PROBLEMS")
