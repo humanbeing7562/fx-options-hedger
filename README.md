@@ -10,6 +10,8 @@ The pricing and the vol surface are written in C++ (exposed to Python with pybin
 QuantLib for SABR). The book, hedging logic and game rules are Python, served through a
 FastAPI backend, with a React front end on top.
 
+![The desk after a day: order ticket, risk, hedge suggestions and P&L](readme_images/00_overview.jpg)
+
 ## What it does
 
 Each session walks forward through the fixings (10:00, 11:00, 14:00, 15:00 and 16:00 Beijing
@@ -40,21 +42,35 @@ Sessions are saved, so you can close the page and come back to one later.
    interesting one: nothing gets hedged unless you do it. *End of day* and *threshold*
    hedge automatically, either at each day's close or whenever a limit is breached. You
    can also set the delta and vega limits the risk panel colours against.
+
+   ![Starting a session](readme_images/01_start_session.jpg)
 2. **Take a client trade.** In the order ticket choose *Client order* and the side the client
    wants ("Client buys" means you sell). Pick the option, then a price: your quote (the client
    pays your ask or receives your bid), mid, an agreed vol, or an agreed premium. The quote
    box shows the premium, your edge against mid and what the trade does to your Greeks
    before you book it.
+
+   <img src="readme_images/02_order_ticket.jpg" alt="Order ticket: a client buying 10m of a 1M 25-delta call at our ask" width="420">
 3. **Look at the risk panel.** Each Greek is coloured against its limit. The bucket table
    shows where the risk sits by expiry, with a Spot row and a Total row underneath.
+
+   <img src="readme_images/03_risk_panel.jpg" alt="Risk panel after the trade: short delta, gamma and vega in the 1M bucket" width="520">
 4. **Hedge.** Either press *Flatten now* for delta and *Book whole plan* for the smile, or
    send individual legs to the ticket (choose *Our hedge (market)*) and trade them yourself.
+
+   <img src="readme_images/04_hedge_suggestions.jpg" alt="Hedge suggestions: spot for delta, then ATM straddle, risk reversal and butterfly for the 1M bucket" width="520">
 5. **Move the clock.** *Next fixing* goes forward one snapshot, *Run to day's close* goes to
    16:00. The P&L panel then shows what happened: how much came from the spot move (split
    into delta, gamma and the rest), how much from vol, from rates and from time passing.
+
+   <img src="readme_images/05_pnl_after_moving_clock.jpg" alt="P&L breakdown and charts after running the day unhedged" width="420">
 6. **Repeat** until the session runs out of fixings. The tabs at the bottom have your
    positions, orders, every trade, the market (forwards, vols, risk reversals and
    butterflies per tenor) and a log of every step.
+
+   ![Market tab with the 1M smile opened](readme_images/06_market_tab.jpg)
+
+   ![Step log](readme_images/07_step_log.jpg)
 
 A good first exercise: sell a client 10m of a 1M 25-delta call, don't hedge, run a day and
 look at the P&L breakdown. Then do it again, hedged, and compare.
@@ -164,7 +180,6 @@ Run a single uvicorn worker: sessions live in the server's memory.
 
 - The data is five fixings a day on business days only, so there's no overnight or weekend
   trading, and a step can be an hour, overnight or a whole weekend.
-    - This is unfortunately the only free data I've managed to find. Please let me know if there are other free, more granular sources that I can use :) 
 - Suggested hedges trade at mid. Hedges you book through the ticket can pay the market's
   bid/ask instead, if you pick that price.
 - Pillar strikes use spot delta (not premium-adjusted) for every tenor.
