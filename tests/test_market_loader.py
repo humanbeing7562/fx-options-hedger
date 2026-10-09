@@ -1,6 +1,9 @@
 import sys
 import math
-sys.path.insert(0, "build")
+import os
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "build"))
+sys.path.insert(0, PROJECT_ROOT)
 
 import pandas as pd
 from simulation.market_loader import MarketLoader

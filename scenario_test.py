@@ -19,7 +19,10 @@ Independent checks at every step (nothing here trusts the Book's own numbers):
 import sys
 import math
 import time
-sys.path.insert(0, "build")
+import os
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "build"))
+sys.path.insert(0, PROJECT_ROOT)
 
 import pandas as pd
 import fxengine

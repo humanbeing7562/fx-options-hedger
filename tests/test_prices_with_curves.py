@@ -1,6 +1,9 @@
 import sys
 import math
-sys.path.insert(0, "build")
+import os
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "build"))
+sys.path.insert(0, PROJECT_ROOT)
 import fxengine
 
 # 30 Sep 2026 curves (from clean/curves.csv)

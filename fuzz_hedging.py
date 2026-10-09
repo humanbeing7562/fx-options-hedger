@@ -5,7 +5,10 @@ Checks the HEDGED BOOK itself (through the C++ engine), not the plan's predictio
 import sys
 import random
 import time
-sys.path.insert(0, "build")
+import os
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "build"))
+sys.path.insert(0, PROJECT_ROOT)
 
 from simulation.market_loader import MarketLoader
 from simulation.book import Book

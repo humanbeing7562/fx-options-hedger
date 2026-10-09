@@ -5,7 +5,10 @@ these tests check that we use them correctly and that the fits are good.
 import sys
 import math
 import time
-sys.path.insert(0, "build")
+import os
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "build"))
+sys.path.insert(0, PROJECT_ROOT)
 
 import fxengine
 from simulation.market_loader import MarketLoader

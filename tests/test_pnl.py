@@ -15,7 +15,10 @@ Checks for the P&L decomposer (sim/pnl.py) and its use in the Session.
 import sys
 import json
 import math
-sys.path.insert(0, "build")
+import os
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "build"))
+sys.path.insert(0, PROJECT_ROOT)
 
 import pandas as pd
 import fxengine
